@@ -43,6 +43,7 @@ def _connect(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path), timeout=10)
     conn.row_factory = sqlite3.Row
     # Safer defaults for concurrent readers/writers.
+    conn.execute("PRAGMA busy_timeout=5000;")
     conn.execute("PRAGMA foreign_keys=ON;")
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
@@ -403,6 +404,118 @@ class AppointmentRepository:
                 if ap is not None:
                     result.append(ap)
             return result
+
+    def confirm_booking_atomic(
+        self,
+        draft_id: str,
+        appointment_to_create: Appointment,
+        outbox_events: list[OutboxEvent],
+    ) -> Appointment:
+        conn = _connect(self._db_path)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT * FROM appointments
+                WHERE draft_id=?
+                ORDER BY created_at ASC
+                LIMIT 1
+                """,
+                (draft_id,),
+            ).fetchone()
+            existing = _appointment_from_row(row)
+            if existing is not None:
+                appointment = existing
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO appointments (
+                        appointment_id,
+                        draft_id,
+                        user_id,
+                        service_id,
+                        start_datetime_utc,
+                        customer_name,
+                        phone_e164,
+                        status,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        appointment_to_create.appointment_id,
+                        draft_id,
+                        appointment_to_create.user_id,
+                        appointment_to_create.service_id,
+                        appointment_to_create.start_datetime_utc,
+                        appointment_to_create.customer_name,
+                        appointment_to_create.phone_e164,
+                        appointment_to_create.status.value,
+                        appointment_to_create.created_at,
+                        appointment_to_create.updated_at,
+                    ),
+                )
+                appointment = appointment_to_create
+
+            for event in outbox_events:
+                conn.execute(
+                    """
+                    INSERT INTO outbox (
+                        event_id,
+                        event_type,
+                        status,
+                        idempotency_key,
+                        send_at,
+                        payload,
+                        attempts,
+                        last_error,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(idempotency_key) DO UPDATE SET
+                        event_id=excluded.event_id,
+                        event_type=excluded.event_type,
+                        status=excluded.status,
+                        send_at=excluded.send_at,
+                        payload=excluded.payload,
+                        attempts=excluded.attempts,
+                        last_error=excluded.last_error,
+                        created_at=excluded.created_at,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        event.event_id,
+                        event.event_type.value,
+                        event.status.value,
+                        event.idempotency_key,
+                        event.send_at,
+                        _dump_payload(event.payload),
+                        event.attempts,
+                        event.last_error,
+                        event.created_at,
+                        event.updated_at,
+                    ),
+                )
+
+            conn.execute(
+                """
+                UPDATE drafts
+                SET step=?,
+                    updated_at=?
+                WHERE draft_id=?
+                """,
+                (DraftStep.CONFIRM_DONE.value, _now_iso(), draft_id),
+            )
+
+            conn.commit()
+            return appointment
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
 
 class OutboxRepository:
