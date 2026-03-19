@@ -1,0 +1,17 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+      {
+        "name": "Run BOT2",
+        "type": "python",
+        "request": "launch",
+        "module": "app.main",
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "BOT_STORAGE_BACKEND": "sqlite",
+          "SQLITE_DB_PATH": "data/bot2.sqlite3"
+        },
+        "console": "integratedTerminal"
+      }
+    ]
+  }
