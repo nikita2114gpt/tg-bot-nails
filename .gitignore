@@ -1,4 +1,8 @@
-
-.aider*
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
 .env
-.env
+.cursor_*.diff
+logs/
+data/*.json
