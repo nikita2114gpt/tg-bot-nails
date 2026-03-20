@@ -6,3 +6,6 @@ __pycache__/
 .cursor_*.diff
 logs/
 data/*.json
+.aider*
+.aider.*/
+.aider.tags.cache.v4/
