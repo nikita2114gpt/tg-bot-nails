@@ -15,8 +15,14 @@ from app.application.validation import (
     validate_service_id,
     validate_time_string,
 )
-from app.domain.enums import DraftStep, OutboxType
+from app.domain.enums import AppointmentStatus, DraftStep, OutboxType
 from app.domain.models import Appointment, BookingDraft, OutboxEvent
+
+# Одна «активная» будущая CONFIRMED на пользователя; см. get_active_confirmed_for_user.
+ACTIVE_BOOKING_CONFLICT_MESSAGE = (
+    "У вас уже есть активная запись. Откройте «Моя запись» или отмените её перед новой записью."
+)
+BLACKLIST_CONFLICT_MESSAGE = "Запись недоступна. Обратитесь к администратору."
 
 
 class BookingUseCases:
@@ -26,13 +32,74 @@ class BookingUseCases:
         appointment_repo,
         outbox_repo,
         allowed_services: list[str],
+        service_catalog_repo=None,
+        blacklist_repo=None,
+        lifecycle_repo=None,
     ):
         self.draft_repo = draft_repo
         self.appointment_repo = appointment_repo
         self.outbox_repo = outbox_repo
         self.allowed_services = allowed_services
+        self.service_catalog_repo = service_catalog_repo
+        self.blacklist_repo = blacklist_repo
+        self.lifecycle_repo = lifecycle_repo
+
+    def list_available_services(self) -> list[str]:
+        # Runtime canonical rule (temporary, explicit):
+        # service_catalog.name is used as the service value written to draft.service_id
+        # and appointment.service_id. No mapping layer is introduced at this stage.
+        repo = self.service_catalog_repo
+        if repo is None:
+            return list(self.allowed_services)
+        try:
+            rows = repo.list_all()
+            names = [x.name.strip() for x in rows if getattr(x, "is_active", False) and x.name.strip()]
+            if names:
+                # Keep stable order and avoid duplicate labels from catalog.
+                return list(dict.fromkeys(names))
+        except Exception:
+            pass
+        return list(self.allowed_services)
+
+    def _ensure_not_blacklisted(self, user_id: int, phone_e164: str | None = None) -> None:
+        repo = self.blacklist_repo
+        if repo is None:
+            return
+        try:
+            if repo.get_active_by_user_id(user_id) is not None:
+                raise ConflictError(BLACKLIST_CONFLICT_MESSAGE)
+            if phone_e164 and repo.get_active_by_phone(phone_e164) is not None:
+                raise ConflictError(BLACKLIST_CONFLICT_MESSAGE)
+        except ConflictError:
+            raise
+        except Exception:
+            # Не ломаем runtime при временных проблемах data-layer.
+            return
+
+    def _get_active_confirmed_for_user(self, user_id: int) -> Appointment | None:
+        fn = getattr(self.appointment_repo, "get_active_confirmed_for_user", None)
+        if callable(fn):
+            return fn(user_id)
+        try:
+            items = self.appointment_repo.list_by_user_id(user_id)
+        except AttributeError:
+            items = [a for a in self.appointment_repo.list_all() if a.user_id == user_id]
+        now_key = datetime.utcnow().strftime("%Y%m%dT%H%M")
+        future = [
+            a
+            for a in items
+            if a.status == AppointmentStatus.CONFIRMED
+            and (a.start_datetime_utc or "") >= now_key
+        ]
+        if not future:
+            return None
+        future.sort(key=lambda a: (a.start_datetime_utc or "", a.appointment_id or ""))
+        return future[0]
 
     def start_booking(self, user_id: int) -> BookingDraft:
+        self._ensure_not_blacklisted(user_id)
+        if self._get_active_confirmed_for_user(user_id) is not None:
+            raise ConflictError(ACTIVE_BOOKING_CONFLICT_MESSAGE)
         draft = BookingDraft(
             user_id=user_id,
             step=DraftStep.CHOOSE_SERVICE,
@@ -46,7 +113,7 @@ class BookingUseCases:
         if draft.step != DraftStep.CHOOSE_SERVICE:
             raise UserInputError("Неверный шаг для выбора услуги")
 
-        if not validate_service_id(service_id, self.allowed_services):
+        if not validate_service_id(service_id, self.list_available_services()):
             raise UserInputError("Некорректная услуга")
 
         updated = replace(
@@ -92,6 +159,9 @@ class BookingUseCases:
             raise UserInputError("Сначала нужно выбрать дату")
 
         start_datetime_utc = f"{draft.appointment_date}T{time_value}"
+        now_key = datetime.utcnow().strftime("%Y%m%dT%H%M")
+        if start_datetime_utc < now_key:
+            raise UserInputError("Нельзя выбрать прошедшее время")
 
         updated = replace(
             draft,
@@ -122,6 +192,7 @@ class BookingUseCases:
             raise UserInputError("Некорректный телефон")
 
         normalized_phone = normalize_phone(phone)
+        self._ensure_not_blacklisted(user_id, normalized_phone)
 
         updated = replace(
             draft,
@@ -150,6 +221,18 @@ class BookingUseCases:
             ]
         ):
             raise ConflictError("Черновик заполнен не полностью. Попробуйте начать заново: /start")
+        self._ensure_not_blacklisted(user_id, draft.phone_e164)
+
+        ap_draft = self.appointment_repo.get_by_draft_id(draft.draft_id)
+        already_confirmed_here = (
+            ap_draft is not None and ap_draft.status == AppointmentStatus.CONFIRMED
+        )
+        if not already_confirmed_here:
+            active_other = self._get_active_confirmed_for_user(user_id)
+            if active_other is not None and (
+                ap_draft is None or active_other.appointment_id != ap_draft.appointment_id
+            ):
+                raise ConflictError(ACTIVE_BOOKING_CONFLICT_MESSAGE)
 
         # Slot uniqueness: two different drafts must not occupy the same start_datetime_utc.
         existing_for_slot = None
@@ -191,7 +274,7 @@ class BookingUseCases:
 
         self._create_admin_notify_event_once(appointment)
         self._create_reminder_event_once(appointment, hours_before=24)
-        self._create_reminder_event_once(appointment, hours_before=1)
+        self._create_reminder_event_once(appointment, hours_before=2)
 
         updated = replace(
             draft,
@@ -199,6 +282,21 @@ class BookingUseCases:
             updated_at=self._now_iso(),
         )
         self.draft_repo.save_draft(updated)
+
+        # Marker for future lifecycle communication (reactivation).
+        if self.lifecycle_repo is not None:
+            try:
+                from app.domain.ops_models import ClientLifecycleMarker
+
+                marker = self.lifecycle_repo.get_by_user_id(user_id)
+                if marker is None:
+                    marker = ClientLifecycleMarker(user_id=user_id)
+                marker.last_confirmed_at = self._now_iso()
+                marker.last_confirmed_appointment_id = appointment.appointment_id
+                marker.updated_at = self._now_iso()
+                self.lifecycle_repo.save(marker)
+            except Exception:
+                pass
 
         return appointment
 
@@ -293,6 +391,7 @@ class BookingUseCases:
                     event_type=OutboxType.ADMIN_NOTIFY,
                     idempotency_key=key,
                     payload={
+                        "event_kind": "new_booking",
                         "appointment_id": appointment.appointment_id,
                         "draft_id": appointment.draft_id,
                         "user_id": appointment.user_id,

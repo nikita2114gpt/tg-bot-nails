@@ -6,6 +6,14 @@ from typing import Any, Optional
 
 from app.domain.enums import AppointmentStatus, DraftStep, OutboxStatus, OutboxType
 from app.domain.models import Appointment, BookingDraft, OutboxEvent
+from app.domain.ops_models import (
+    BlacklistEntry,
+    ClientLifecycleMarker,
+    DayScheduleOverride,
+    SalonInfoSettings,
+    ScheduleSettings,
+    ServiceCatalogItem,
+)
 
 
 def _now_iso() -> str:
@@ -137,6 +145,113 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         """
     )
 
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS schedule_settings (
+            id INTEGER PRIMARY KEY CHECK (id=1),
+            open_time_hhmm TEXT NOT NULL,
+            close_time_hhmm TEXT NOT NULL,
+            slot_minutes INTEGER NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS day_schedule_overrides (
+            date_yyyymmdd TEXT PRIMARY KEY,
+            is_closed INTEGER NOT NULL,
+            open_time_hhmm TEXT,
+            close_time_hhmm TEXT,
+            slot_minutes INTEGER,
+            updated_at TEXT NOT NULL
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS salon_info_settings (
+            id INTEGER PRIMARY KEY CHECK (id=1),
+            address_text TEXT NOT NULL,
+            contacts_text TEXT NOT NULL,
+            show_address INTEGER NOT NULL,
+            show_contacts INTEGER NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS service_catalog (
+            service_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            duration_minutes INTEGER NOT NULL,
+            price_text TEXT NOT NULL,
+            is_active INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_service_catalog_active
+        ON service_catalog(is_active, name);
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS blacklist_entries (
+            entry_id TEXT PRIMARY KEY,
+            user_id INTEGER,
+            phone_e164 TEXT,
+            reason TEXT,
+            is_active INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_blacklist_user_active
+        ON blacklist_entries(user_id, is_active, created_at DESC);
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_blacklist_phone_active
+        ON blacklist_entries(phone_e164, is_active, created_at DESC);
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS client_lifecycle_markers (
+            user_id INTEGER PRIMARY KEY,
+            last_confirmed_at TEXT,
+            last_confirmed_appointment_id TEXT,
+            last_no_confirm_alert_appointment_id TEXT,
+            last_reactivation_sent_at TEXT,
+            updated_at TEXT NOT NULL
+        );
+        """
+    )
+    try:
+        conn.execute(
+            "ALTER TABLE client_lifecycle_markers ADD COLUMN last_confirmed_appointment_id TEXT;"
+        )
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute(
+            "ALTER TABLE client_lifecycle_markers ADD COLUMN last_no_confirm_alert_appointment_id TEXT;"
+        )
+    except sqlite3.OperationalError:
+        pass
+
 
 def _draft_from_row(row: sqlite3.Row) -> Optional[BookingDraft]:
     if row is None:
@@ -224,6 +339,135 @@ def _outbox_from_row(row: sqlite3.Row) -> Optional[OutboxEvent]:
         attempts=int(row["attempts"]) if row["attempts"] is not None else 0,
         last_error=row["last_error"] if isinstance(row["last_error"], str) else None,
         created_at=created_at,
+        updated_at=updated_at,
+    )
+
+
+def _schedule_settings_from_row(row: sqlite3.Row) -> Optional[ScheduleSettings]:
+    if row is None:
+        return None
+    try:
+        slot_minutes = int(row["slot_minutes"])
+    except Exception:
+        slot_minutes = 60
+    updated_at = row["updated_at"] if isinstance(row["updated_at"], str) else _now_iso()
+    return ScheduleSettings(
+        open_time_hhmm=row["open_time_hhmm"] or "0800",
+        close_time_hhmm=row["close_time_hhmm"] or "2000",
+        slot_minutes=slot_minutes,
+        updated_at=updated_at,
+    )
+
+
+def _day_override_from_row(row: sqlite3.Row) -> Optional[DayScheduleOverride]:
+    if row is None:
+        return None
+    slot_minutes = None
+    if row["slot_minutes"] is not None:
+        try:
+            slot_minutes = int(row["slot_minutes"])
+        except Exception:
+            slot_minutes = None
+    updated_at = row["updated_at"] if isinstance(row["updated_at"], str) else _now_iso()
+    return DayScheduleOverride(
+        date_yyyymmdd=row["date_yyyymmdd"] or "",
+        is_closed=bool(int(row["is_closed"])) if row["is_closed"] is not None else False,
+        open_time_hhmm=row["open_time_hhmm"] if isinstance(row["open_time_hhmm"], str) else None,
+        close_time_hhmm=row["close_time_hhmm"] if isinstance(row["close_time_hhmm"], str) else None,
+        slot_minutes=slot_minutes,
+        updated_at=updated_at,
+    )
+
+
+def _salon_info_from_row(row: sqlite3.Row) -> Optional[SalonInfoSettings]:
+    if row is None:
+        return None
+    updated_at = row["updated_at"] if isinstance(row["updated_at"], str) else _now_iso()
+    return SalonInfoSettings(
+        address_text=row["address_text"] if isinstance(row["address_text"], str) else "",
+        contacts_text=row["contacts_text"] if isinstance(row["contacts_text"], str) else "",
+        show_address=bool(int(row["show_address"])) if row["show_address"] is not None else True,
+        show_contacts=bool(int(row["show_contacts"])) if row["show_contacts"] is not None else True,
+        updated_at=updated_at,
+    )
+
+
+def _service_item_from_row(row: sqlite3.Row) -> Optional[ServiceCatalogItem]:
+    if row is None:
+        return None
+    try:
+        duration_minutes = int(row["duration_minutes"])
+    except Exception:
+        duration_minutes = 60
+    created_at = row["created_at"] if isinstance(row["created_at"], str) else _now_iso()
+    updated_at = row["updated_at"] if isinstance(row["updated_at"], str) else _now_iso()
+    return ServiceCatalogItem(
+        service_id=row["service_id"] or "",
+        name=row["name"] or "",
+        duration_minutes=duration_minutes,
+        price_text=row["price_text"] or "—",
+        is_active=bool(int(row["is_active"])) if row["is_active"] is not None else True,
+        created_at=created_at,
+        updated_at=updated_at,
+    )
+
+
+def _blacklist_from_row(row: sqlite3.Row) -> Optional[BlacklistEntry]:
+    if row is None:
+        return None
+    user_id = None
+    if row["user_id"] is not None:
+        try:
+            user_id = int(row["user_id"])
+        except Exception:
+            user_id = None
+    phone_e164 = row["phone_e164"] if isinstance(row["phone_e164"], str) else None
+    reason = row["reason"] if isinstance(row["reason"], str) else None
+    created_at = row["created_at"] if isinstance(row["created_at"], str) else _now_iso()
+    updated_at = row["updated_at"] if isinstance(row["updated_at"], str) else _now_iso()
+    return BlacklistEntry(
+        entry_id=row["entry_id"] or "",
+        user_id=user_id,
+        phone_e164=phone_e164,
+        reason=reason,
+        is_active=bool(int(row["is_active"])) if row["is_active"] is not None else True,
+        created_at=created_at,
+        updated_at=updated_at,
+    )
+
+
+def _lifecycle_marker_from_row(row: sqlite3.Row) -> Optional[ClientLifecycleMarker]:
+    if row is None:
+        return None
+    try:
+        user_id = int(row["user_id"])
+    except Exception:
+        return None
+    last_confirmed_at = (
+        row["last_confirmed_at"] if isinstance(row["last_confirmed_at"], str) else None
+    )
+    last_confirmed_appointment_id = (
+        row["last_confirmed_appointment_id"]
+        if isinstance(row["last_confirmed_appointment_id"], str)
+        else None
+    )
+    last_no_confirm_alert_appointment_id = (
+        row["last_no_confirm_alert_appointment_id"]
+        if isinstance(row["last_no_confirm_alert_appointment_id"], str)
+        else None
+    )
+    last_reactivation_sent_at = (
+        row["last_reactivation_sent_at"]
+        if isinstance(row["last_reactivation_sent_at"], str)
+        else None
+    )
+    updated_at = row["updated_at"] if isinstance(row["updated_at"], str) else _now_iso()
+    return ClientLifecycleMarker(
+        user_id=user_id,
+        last_confirmed_at=last_confirmed_at,
+        last_confirmed_appointment_id=last_confirmed_appointment_id,
+        last_no_confirm_alert_appointment_id=last_no_confirm_alert_appointment_id,
+        last_reactivation_sent_at=last_reactivation_sent_at,
         updated_at=updated_at,
     )
 
@@ -397,6 +641,115 @@ class AppointmentRepository:
                 SELECT * FROM appointments
                 ORDER BY created_at ASC
                 """
+            ).fetchall()
+            result: list[Appointment] = []
+            for row in rows:
+                ap = _appointment_from_row(row)
+                if ap is not None:
+                    result.append(ap)
+            return result
+
+    def list_by_user_id(self, user_id: int) -> list[Appointment]:
+        with _connect(self._db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM appointments
+                WHERE user_id=?
+                ORDER BY start_datetime_utc ASC, created_at ASC
+                """,
+                (user_id,),
+            ).fetchall()
+            result: list[Appointment] = []
+            for row in rows:
+                ap = _appointment_from_row(row)
+                if ap is not None:
+                    result.append(ap)
+            return result
+
+    def get_active_confirmed_for_user(self, user_id: int) -> Optional[Appointment]:
+        """
+        Активная запись: CONFIRMED, start_datetime_utc >= now (UTC, формат %Y%m%dT%H%M),
+        ближайшая по слоту; при тай-брейке — appointment_id ASC.
+        """
+        now_key = datetime.utcnow().strftime("%Y%m%dT%H%M")
+        with _connect(self._db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM appointments
+                WHERE user_id=? AND status=? AND start_datetime_utc >= ?
+                ORDER BY start_datetime_utc ASC, appointment_id ASC
+                LIMIT 1
+                """,
+                (user_id, AppointmentStatus.CONFIRMED.value, now_key),
+            ).fetchone()
+            return _appointment_from_row(row)
+
+    def list_by_status(self, status: AppointmentStatus) -> list[Appointment]:
+        with _connect(self._db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM appointments
+                WHERE status=?
+                ORDER BY start_datetime_utc ASC, created_at ASC
+                """,
+                (status.value,),
+            ).fetchall()
+            result: list[Appointment] = []
+            for row in rows:
+                ap = _appointment_from_row(row)
+                if ap is not None:
+                    result.append(ap)
+            return result
+
+    def list_starting_with_date(self, date_yyyymmdd: str) -> list[Appointment]:
+        prefix = f"{date_yyyymmdd.strip()}%"
+        with _connect(self._db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM appointments
+                WHERE start_datetime_utc LIKE ?
+                ORDER BY start_datetime_utc ASC, created_at ASC
+                """,
+                (prefix,),
+            ).fetchall()
+            result: list[Appointment] = []
+            for row in rows:
+                ap = _appointment_from_row(row)
+                if ap is not None:
+                    result.append(ap)
+            return result
+
+    def search_appointments(
+        self,
+        name_substr: Optional[str] = None,
+        phone_substr: Optional[str] = None,
+        date_yyyymmdd: Optional[str] = None,
+    ) -> list[Appointment]:
+        name_substr = (name_substr or "").strip()
+        phone_substr = (phone_substr or "").strip()
+        date_yyyymmdd = (date_yyyymmdd or "").strip()
+
+        clauses: list[str] = []
+        params: list[Any] = []
+        if name_substr:
+            clauses.append("LOWER(customer_name) LIKE ?")
+            params.append(f"%{name_substr.lower()}%")
+        if phone_substr:
+            clauses.append("LOWER(phone_e164) LIKE ?")
+            params.append(f"%{phone_substr.lower()}%")
+        if date_yyyymmdd:
+            clauses.append("start_datetime_utc LIKE ?")
+            params.append(f"{date_yyyymmdd}%")
+
+        where_sql = " AND ".join(clauses) if clauses else "1=1"
+        with _connect(self._db_path) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM appointments
+                WHERE {where_sql}
+                ORDER BY start_datetime_utc ASC, created_at ASC
+                """,
+                params,
             ).fetchall()
             result: list[Appointment] = []
             for row in rows:
@@ -614,5 +967,323 @@ class OutboxRepository:
                 WHERE event_id=?
                 """,
                 (OutboxStatus.FAILED.value, error_message, _now_iso(), event_id),
+            )
+
+
+class ScheduleSettingsRepository:
+    def __init__(self, db_path: str | Path):
+        self._db_path = Path(db_path)
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        with _connect(self._db_path) as conn:
+            _init_schema(conn)
+
+    def get(self) -> ScheduleSettings:
+        with _connect(self._db_path) as conn:
+            row = conn.execute(
+                "SELECT * FROM schedule_settings WHERE id=1 LIMIT 1"
+            ).fetchone()
+            parsed = _schedule_settings_from_row(row)
+            if parsed is not None:
+                return parsed
+        return ScheduleSettings()
+
+    def save(self, settings: ScheduleSettings) -> None:
+        with _connect(self._db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO schedule_settings (id, open_time_hhmm, close_time_hhmm, slot_minutes, updated_at)
+                VALUES (1, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    open_time_hhmm=excluded.open_time_hhmm,
+                    close_time_hhmm=excluded.close_time_hhmm,
+                    slot_minutes=excluded.slot_minutes,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    settings.open_time_hhmm,
+                    settings.close_time_hhmm,
+                    settings.slot_minutes,
+                    settings.updated_at,
+                ),
+            )
+
+
+class DayScheduleOverrideRepository:
+    def __init__(self, db_path: str | Path):
+        self._db_path = Path(db_path)
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        with _connect(self._db_path) as conn:
+            _init_schema(conn)
+
+    def get_by_date(self, date_yyyymmdd: str) -> Optional[DayScheduleOverride]:
+        with _connect(self._db_path) as conn:
+            row = conn.execute(
+                "SELECT * FROM day_schedule_overrides WHERE date_yyyymmdd=? LIMIT 1",
+                (date_yyyymmdd,),
+            ).fetchone()
+            return _day_override_from_row(row)
+
+    def list_all(self) -> list[DayScheduleOverride]:
+        with _connect(self._db_path) as conn:
+            rows = conn.execute(
+                "SELECT * FROM day_schedule_overrides ORDER BY date_yyyymmdd ASC"
+            ).fetchall()
+            result: list[DayScheduleOverride] = []
+            for row in rows:
+                item = _day_override_from_row(row)
+                if item is not None:
+                    result.append(item)
+            return result
+
+    def save(self, item: DayScheduleOverride) -> None:
+        with _connect(self._db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO day_schedule_overrides (
+                    date_yyyymmdd, is_closed, open_time_hhmm, close_time_hhmm, slot_minutes, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(date_yyyymmdd) DO UPDATE SET
+                    is_closed=excluded.is_closed,
+                    open_time_hhmm=excluded.open_time_hhmm,
+                    close_time_hhmm=excluded.close_time_hhmm,
+                    slot_minutes=excluded.slot_minutes,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    item.date_yyyymmdd,
+                    1 if item.is_closed else 0,
+                    item.open_time_hhmm,
+                    item.close_time_hhmm,
+                    item.slot_minutes,
+                    item.updated_at,
+                ),
+            )
+
+
+class SalonInfoSettingsRepository:
+    def __init__(self, db_path: str | Path):
+        self._db_path = Path(db_path)
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        with _connect(self._db_path) as conn:
+            _init_schema(conn)
+
+    def get(self) -> Optional[SalonInfoSettings]:
+        with _connect(self._db_path) as conn:
+            row = conn.execute(
+                "SELECT * FROM salon_info_settings WHERE id=1 LIMIT 1"
+            ).fetchone()
+            return _salon_info_from_row(row)
+
+    def save(self, value: SalonInfoSettings) -> None:
+        with _connect(self._db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO salon_info_settings (
+                    id, address_text, contacts_text, show_address, show_contacts, updated_at
+                )
+                VALUES (1, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    address_text=excluded.address_text,
+                    contacts_text=excluded.contacts_text,
+                    show_address=excluded.show_address,
+                    show_contacts=excluded.show_contacts,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    value.address_text,
+                    value.contacts_text,
+                    1 if value.show_address else 0,
+                    1 if value.show_contacts else 0,
+                    value.updated_at,
+                ),
+            )
+
+
+class ServiceCatalogRepository:
+    def __init__(self, db_path: str | Path):
+        self._db_path = Path(db_path)
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        with _connect(self._db_path) as conn:
+            _init_schema(conn)
+
+    def save_item(self, item: ServiceCatalogItem) -> None:
+        with _connect(self._db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO service_catalog (
+                    service_id, name, duration_minutes, price_text, is_active, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(service_id) DO UPDATE SET
+                    name=excluded.name,
+                    duration_minutes=excluded.duration_minutes,
+                    price_text=excluded.price_text,
+                    is_active=excluded.is_active,
+                    created_at=excluded.created_at,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    item.service_id,
+                    item.name,
+                    item.duration_minutes,
+                    item.price_text,
+                    1 if item.is_active else 0,
+                    item.created_at,
+                    item.updated_at,
+                ),
+            )
+
+    def get_by_id(self, service_id: str) -> Optional[ServiceCatalogItem]:
+        with _connect(self._db_path) as conn:
+            row = conn.execute(
+                "SELECT * FROM service_catalog WHERE service_id=? LIMIT 1",
+                (service_id,),
+            ).fetchone()
+            return _service_item_from_row(row)
+
+    def list_all(self) -> list[ServiceCatalogItem]:
+        with _connect(self._db_path) as conn:
+            rows = conn.execute(
+                "SELECT * FROM service_catalog ORDER BY is_active DESC, name ASC"
+            ).fetchall()
+            result: list[ServiceCatalogItem] = []
+            for row in rows:
+                item = _service_item_from_row(row)
+                if item is not None:
+                    result.append(item)
+            return result
+
+    def delete_item(self, service_id: str) -> None:
+        with _connect(self._db_path) as conn:
+            conn.execute(
+                "DELETE FROM service_catalog WHERE service_id=?",
+                (service_id,),
+            )
+
+
+class BlacklistRepository:
+    def __init__(self, db_path: str | Path):
+        self._db_path = Path(db_path)
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        with _connect(self._db_path) as conn:
+            _init_schema(conn)
+
+    def save_entry(self, entry: BlacklistEntry) -> None:
+        with _connect(self._db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO blacklist_entries (
+                    entry_id, user_id, phone_e164, reason, is_active, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(entry_id) DO UPDATE SET
+                    user_id=excluded.user_id,
+                    phone_e164=excluded.phone_e164,
+                    reason=excluded.reason,
+                    is_active=excluded.is_active,
+                    created_at=excluded.created_at,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    entry.entry_id,
+                    entry.user_id,
+                    entry.phone_e164,
+                    entry.reason,
+                    1 if entry.is_active else 0,
+                    entry.created_at,
+                    entry.updated_at,
+                ),
+            )
+
+    def get_active_by_user_id(self, user_id: int) -> Optional[BlacklistEntry]:
+        with _connect(self._db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM blacklist_entries
+                WHERE user_id=? AND is_active=1
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (user_id,),
+            ).fetchone()
+            return _blacklist_from_row(row)
+
+    def get_active_by_phone(self, phone_e164: str) -> Optional[BlacklistEntry]:
+        with _connect(self._db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM blacklist_entries
+                WHERE phone_e164=? AND is_active=1
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (phone_e164,),
+            ).fetchone()
+            return _blacklist_from_row(row)
+
+    def list_all(self) -> list[BlacklistEntry]:
+        with _connect(self._db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM blacklist_entries
+                ORDER BY is_active DESC, created_at DESC
+                """
+            ).fetchall()
+            result: list[BlacklistEntry] = []
+            for row in rows:
+                entry = _blacklist_from_row(row)
+                if entry is not None:
+                    result.append(entry)
+            return result
+
+
+class ClientLifecycleMarkerRepository:
+    def __init__(self, db_path: str | Path):
+        self._db_path = Path(db_path)
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        with _connect(self._db_path) as conn:
+            _init_schema(conn)
+
+    def get_by_user_id(self, user_id: int) -> Optional[ClientLifecycleMarker]:
+        with _connect(self._db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM client_lifecycle_markers
+                WHERE user_id=?
+                LIMIT 1
+                """,
+                (user_id,),
+            ).fetchone()
+            return _lifecycle_marker_from_row(row)
+
+    def save(self, marker: ClientLifecycleMarker) -> None:
+        with _connect(self._db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO client_lifecycle_markers (
+                    user_id,
+                    last_confirmed_at,
+                    last_confirmed_appointment_id,
+                    last_no_confirm_alert_appointment_id,
+                    last_reactivation_sent_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    last_confirmed_at=excluded.last_confirmed_at,
+                    last_confirmed_appointment_id=excluded.last_confirmed_appointment_id,
+                    last_no_confirm_alert_appointment_id=excluded.last_no_confirm_alert_appointment_id,
+                    last_reactivation_sent_at=excluded.last_reactivation_sent_at,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    marker.user_id,
+                    marker.last_confirmed_at,
+                    marker.last_confirmed_appointment_id,
+                    marker.last_no_confirm_alert_appointment_id,
+                    marker.last_reactivation_sent_at,
+                    marker.updated_at,
+                ),
             )
 

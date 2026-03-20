@@ -14,7 +14,7 @@ async def help_handler(message: Message) -> None:
 
     await message.answer(
         "Я бот для записи на услуги.\n"
-        "Команды: /start, /help\n"
+        "Команды: /start (главное меню), /help\n"
         "Если что-то пошло не так — попробуйте /start ещё раз."
     )
 

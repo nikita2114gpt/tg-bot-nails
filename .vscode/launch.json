@@ -12,6 +12,13 @@
           "SQLITE_DB_PATH": "data/bot2.sqlite3"
         },
         "console": "integratedTerminal"
+      },
+      {
+        "name": "BOT2 Control Button",
+        "type": "node-terminal",
+        "request": "launch",
+        "command": "${workspaceFolder}\\bot_control.bat",
+        "cwd": "${workspaceFolder}"
       }
     ]
   }
