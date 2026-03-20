@@ -9,3 +9,7 @@ data/*.json
 .aider*
 .aider.*/
 .aider.tags.cache.v4/
+data/
+*.sqlite3
+*.db
+*.json
