@@ -23,6 +23,8 @@ ACTIVE_BOOKING_CONFLICT_MESSAGE = (
     "У вас уже есть активная запись. Откройте «Моя запись» или отмените её перед новой записью."
 )
 BLACKLIST_CONFLICT_MESSAGE = "Запись недоступна. Обратитесь к администратору."
+# ConflictError при коллизии слота в confirm_booking (presentation сравнивает с этим текстом).
+BOOKING_SLOT_CONFLICT_MESSAGE = "Это время уже занято, выберите другое."
 
 
 class BookingUseCases:
@@ -35,6 +37,7 @@ class BookingUseCases:
         service_catalog_repo=None,
         blacklist_repo=None,
         lifecycle_repo=None,
+        allow_multiple_active_bookings: bool = False,
     ):
         self.draft_repo = draft_repo
         self.appointment_repo = appointment_repo
@@ -43,6 +46,7 @@ class BookingUseCases:
         self.service_catalog_repo = service_catalog_repo
         self.blacklist_repo = blacklist_repo
         self.lifecycle_repo = lifecycle_repo
+        self._allow_multiple_active_bookings = allow_multiple_active_bookings
 
     def list_available_services(self) -> list[str]:
         # Runtime canonical rule (temporary, explicit):
@@ -98,7 +102,10 @@ class BookingUseCases:
 
     def start_booking(self, user_id: int) -> BookingDraft:
         self._ensure_not_blacklisted(user_id)
-        if self._get_active_confirmed_for_user(user_id) is not None:
+        if (
+            not self._allow_multiple_active_bookings
+            and self._get_active_confirmed_for_user(user_id) is not None
+        ):
             raise ConflictError(ACTIVE_BOOKING_CONFLICT_MESSAGE)
         draft = BookingDraft(
             user_id=user_id,
@@ -207,6 +214,14 @@ class BookingUseCases:
     def confirm_booking(self, draft_id: str, user_id: int) -> Appointment:
         draft = self._get_user_draft(draft_id, user_id)
 
+        # Идемпотентность: запись уже создана по этому draft_id — не гоняем слот/insert повторно.
+        existing_ap = self.appointment_repo.get_by_draft_id(draft_id)
+        if existing_ap is not None and existing_ap.status == AppointmentStatus.CONFIRMED:
+            if draft.step != DraftStep.CONFIRM_DONE:
+                fixed = replace(draft, step=DraftStep.CONFIRM_DONE, updated_at=self._now_iso())
+                self.draft_repo.save_draft(fixed)
+            return existing_ap
+
         if draft.step != DraftStep.CONFIRM:
             raise UserInputError("Неверный шаг для подтверждения")
 
@@ -227,7 +242,7 @@ class BookingUseCases:
         already_confirmed_here = (
             ap_draft is not None and ap_draft.status == AppointmentStatus.CONFIRMED
         )
-        if not already_confirmed_here:
+        if not self._allow_multiple_active_bookings and not already_confirmed_here:
             active_other = self._get_active_confirmed_for_user(user_id)
             if active_other is not None and (
                 ap_draft is None or active_other.appointment_id != ap_draft.appointment_id
@@ -246,9 +261,10 @@ class BookingUseCases:
 
         if (
             existing_for_slot is not None
+            and existing_for_slot.status == AppointmentStatus.CONFIRMED
             and existing_for_slot.draft_id != draft.draft_id
         ):
-            raise ConflictError("Это время уже занято, выберите другое.")
+            raise ConflictError(BOOKING_SLOT_CONFLICT_MESSAGE)
 
         try:
             appointment = create_appointment_once(
@@ -263,12 +279,12 @@ class BookingUseCases:
                 import sqlite3
 
                 if isinstance(e, sqlite3.IntegrityError) and "start_datetime_utc" in str(e):
-                    raise ConflictError("Это время уже занято, выберите другое.")
+                    raise ConflictError(BOOKING_SLOT_CONFLICT_MESSAGE)
             except Exception:
                 pass
 
             if "UNIQUE constraint failed" in str(e) and "start_datetime_utc" in str(e):
-                raise ConflictError("Это время уже занято, выберите другое.")
+                raise ConflictError(BOOKING_SLOT_CONFLICT_MESSAGE)
 
             raise
 

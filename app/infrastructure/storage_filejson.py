@@ -541,8 +541,11 @@ class AppointmentRepository:
         for a in _ensure_list(data.get("appointments")):
             if not isinstance(a, dict):
                 continue
-            if a.get("start_datetime_utc") == start_datetime_utc:
-                return _appointment_from_dict(a)
+            if a.get("start_datetime_utc") != start_datetime_utc:
+                continue
+            ap = _appointment_from_dict(a)
+            if ap is not None and ap.status == AppointmentStatus.CONFIRMED:
+                return ap
 
         return None
 

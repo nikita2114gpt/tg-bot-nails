@@ -22,9 +22,15 @@ def service_keyboard(draft_id: str, services: list[str]) -> InlineKeyboardMarkup
     return builder.as_markup()
 
 
-def date_keyboard(draft_id: str, dates: list[str], closed_dates: set[str] | None = None) -> InlineKeyboardMarkup:
+def date_keyboard(
+    draft_id: str,
+    dates: list[str],
+    closed_dates: set[str] | None = None,
+    fully_busy_dates: set[str] | None = None,
+) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     closed_dates = closed_dates or set()
+    fully_busy_dates = fully_busy_dates or set()
     norm_dates = [d for d in dates if len(d) == 8 and d.isdigit()]
     if not norm_dates:
         norm_dates = dates
@@ -49,6 +55,9 @@ def date_keyboard(draft_id: str, dates: list[str], closed_dates: set[str] | None
         callback_payload = date_value
         if date_value in closed_dates:
             label = f"🚫{label}"
+            callback_payload = f"x_{date_value}"
+        elif date_value in fully_busy_dates:
+            label = f"🔒{label}"
             callback_payload = f"x_{date_value}"
         builder.button(text=label, callback_data=build_callback("date", draft_id, callback_payload))
 
@@ -89,7 +98,7 @@ def time_keyboard(
             label = f"{time_value[:2]}:{time_value[2:]}"
         payload = time_value
         if time_value in occupied_slots:
-            label = f"🚫 {label}"
+            label = f"🔒 {label}"
             payload = f"x_{time_value}"
         builder.button(
             text=label,

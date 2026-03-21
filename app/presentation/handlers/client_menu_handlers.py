@@ -3,7 +3,7 @@ from __future__ import annotations
 from aiogram import F, Router
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from app.application.admin_ops_uc import AdminOpsUseCases
@@ -13,18 +13,31 @@ from app.config import Settings
 from app.core.errors import AppError, ConflictError, error_to_user_message
 from app.domain.enums import AppointmentStatus
 from app.presentation.callback.nav_callbacks import build_client_cancel_my, parse_client
-from app.presentation.fsm.states import BookingStates
+from app.presentation.fsm.admin_guard import is_active_admin_fsm
+from app.presentation.fsm.states import AdminStates, BookingStates
 from app.presentation.keyboards.booking_kb import service_keyboard
 from app.presentation.keyboards.main_menu_kb import (
     BTN_ADDRESS,
     BTN_BOOK,
     BTN_MAIN_MENU,
+    BTN_MENU,
     BTN_MY_APPT,
     BTN_SERVICES_INFO,
     main_menu_reply_keyboard,
 )
 
 router = Router(name="client_menu")
+
+
+def _start_booking_conflict_user_text(exc: ConflictError) -> str:
+    """
+    start_booking() может кинуть ConflictError из blacklist или из проверки активной записи.
+    Нельзя подменять текст исключения на «активная запись» — иначе blacklist выглядит как дубликат записи.
+    """
+    msg = str(exc)
+    if msg == ACTIVE_BOOKING_CONFLICT_MESSAGE:
+        return f"{msg}\n\nНажмите «Моя запись», чтобы увидеть текущую запись."
+    return msg
 
 
 def _fmt_duration_minutes(value: int) -> str:
@@ -98,28 +111,37 @@ def _my_appt_text(settings: Settings, ap, admin_ops_uc: AdminOpsUseCases) -> str
     )
 
 
-@router.message(Command("start"))
+@router.message(Command("start"), ~StateFilter(AdminStates))
 async def cmd_start(
     message: Message,
     state: FSMContext,
 ) -> None:
     await state.clear()
+    try:
+        await message.answer("\u200b", reply_markup=ReplyKeyboardRemove())
+    except Exception:
+        pass
     await message.answer(
         "Главное меню. Выберите действие:",
         reply_markup=main_menu_reply_keyboard(),
     )
 
 
-@router.message(F.text == BTN_MAIN_MENU)
+@router.message(F.text == BTN_MAIN_MENU, ~StateFilter(AdminStates))
+@router.message(F.text == BTN_MENU, ~StateFilter(AdminStates))
 async def go_main_menu(message: Message, state: FSMContext) -> None:
     await state.clear()
+    try:
+        await message.answer("\u200b", reply_markup=ReplyKeyboardRemove())
+    except Exception:
+        pass
     await message.answer(
         "Главное меню.",
         reply_markup=main_menu_reply_keyboard(),
     )
 
 
-@router.message(F.text == BTN_BOOK)
+@router.message(F.text == BTN_BOOK, ~StateFilter(AdminStates))
 async def start_booking_from_menu(
     message: Message,
     state: FSMContext,
@@ -131,11 +153,14 @@ async def start_booking_from_menu(
 
     await state.clear()
     try:
+        await message.answer("\u200b", reply_markup=ReplyKeyboardRemove())
+    except Exception:
+        pass
+    try:
         draft = booking_uc.start_booking(user_id=message.from_user.id)
-    except ConflictError:
+    except ConflictError as e:
         await message.answer(
-            f"{ACTIVE_BOOKING_CONFLICT_MESSAGE}\n\n"
-            "Нажмите «Моя запись», чтобы увидеть текущую запись.",
+            _start_booking_conflict_user_text(e),
             reply_markup=main_menu_reply_keyboard(),
         )
         return
@@ -146,7 +171,7 @@ async def start_booking_from_menu(
     )
 
 
-@router.message(F.text == BTN_MY_APPT)
+@router.message(F.text == BTN_MY_APPT, ~StateFilter(AdminStates))
 async def my_appointment(
     message: Message,
     state: FSMContext,
@@ -182,7 +207,7 @@ async def my_appointment(
     )
 
 
-@router.message(F.text == BTN_SERVICES_INFO)
+@router.message(F.text == BTN_SERVICES_INFO, ~StateFilter(AdminStates))
 async def services_info(
     message: Message,
     settings: Settings,
@@ -192,7 +217,7 @@ async def services_info(
     await message.answer(_service_card_lines(settings, booking_uc, admin_ops_uc))
 
 
-@router.message(F.text == BTN_ADDRESS)
+@router.message(F.text == BTN_ADDRESS, ~StateFilter(AdminStates))
 async def address_info(message: Message, settings: Settings, admin_ops_uc: AdminOpsUseCases) -> None:
     await message.answer(_contacts_text(settings, admin_ops_uc))
 
@@ -212,6 +237,15 @@ async def client_inline_nav(
     settings: Settings,
     appointment_uc: AppointmentUseCases,
 ) -> None:
+    if await is_active_admin_fsm(state):
+        try:
+            await callback.answer(
+                "Сначала завершите ввод в админке или откройте /admin.",
+                show_alert=True,
+            )
+        except Exception:
+            pass
+        return
     await _safe_cq_answer(callback)
     if callback.data is None or callback.message is None:
         return
@@ -223,6 +257,10 @@ async def client_inline_nav(
 
     if action == "menu":
         await state.clear()
+        try:
+            await callback.message.answer("\u200b", reply_markup=ReplyKeyboardRemove())
+        except Exception:
+            pass
         await callback.message.answer(
             "Главное меню.",
             reply_markup=main_menu_reply_keyboard(),
@@ -234,11 +272,14 @@ async def client_inline_nav(
         if callback.from_user is None:
             return
         try:
+            await callback.message.answer("\u200b", reply_markup=ReplyKeyboardRemove())
+        except Exception:
+            pass
+        try:
             draft = booking_uc.start_booking(user_id=callback.from_user.id)
-        except ConflictError:
+        except ConflictError as e:
             await callback.message.answer(
-                f"{ACTIVE_BOOKING_CONFLICT_MESSAGE}\n\n"
-                "Нажмите «Моя запись», чтобы увидеть текущую запись.",
+                _start_booking_conflict_user_text(e),
                 reply_markup=main_menu_reply_keyboard(),
             )
             return

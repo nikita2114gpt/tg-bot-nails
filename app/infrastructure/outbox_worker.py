@@ -2,7 +2,7 @@ import asyncio
 import sqlite3
 from datetime import datetime, timedelta
 
-from app.domain.enums import OutboxType
+from app.domain.enums import AppointmentStatus, OutboxType
 from app.domain.models import OutboxEvent
 from app.domain.ops_models import ClientLifecycleMarker
 
@@ -33,6 +33,25 @@ class OutboxWorker:
     def stop(self):
         self._running = False
 
+    def _delivery_allowed_for_reminder_client(self, event: OutboxEvent) -> bool:
+        """
+        Pending REMINDER_CLIENT создаётся при confirm и не удаляется при cancel записи.
+        Перед отправкой сверяемся с БД: только CONFIRMED и существующий appointment_id.
+        """
+        if self.appointment_repo is None:
+            return True
+        p = event.payload if isinstance(event.payload, dict) else {}
+        appointment_id = str(p.get("appointment_id") or "").strip()
+        if not appointment_id:
+            return True
+        try:
+            ap = self.appointment_repo.get_by_id(appointment_id)
+        except Exception:
+            return False
+        if ap is None:
+            return False
+        return ap.status == AppointmentStatus.CONFIRMED
+
     async def _process_once(self):
         now_iso = datetime.utcnow().isoformat()
         self._enqueue_reactivation_events(now_iso)
@@ -46,6 +65,12 @@ class OutboxWorker:
                 if event.event_type == OutboxType.ADMIN_NOTIFY:
                     await self.sender.send_admin_notify(event)
                 elif event.event_type == OutboxType.REMINDER_CLIENT:
+                    if not self._delivery_allowed_for_reminder_client(event):
+                        self.outbox_repo.mark_failed(
+                            event.event_id,
+                            "skipped: appointment missing or not confirmed",
+                        )
+                        continue
                     await self.sender.send_client_reminder(event)
                     self._handle_no_confirm_alert(event)
                 else:

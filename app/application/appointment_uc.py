@@ -201,6 +201,14 @@ class AppointmentUseCases:
     def admin_list_cancelled(self) -> list[Appointment]:
         return self._list_by_status(AppointmentStatus.CANCELLED)
 
+    def admin_list_active(self) -> list[Appointment]:
+        """Подтверждённые записи с текущего момента (UTC), не отменённые."""
+        items = self._list_by_status(AppointmentStatus.CONFIRMED)
+        now_key = datetime.utcnow().strftime("%Y%m%dT%H%M")
+        out = [a for a in items if (a.start_datetime_utc or "") >= now_key]
+        out.sort(key=lambda x: x.start_datetime_utc)
+        return out
+
     def admin_search(self, raw_query: str) -> list[Appointment]:
         q = (raw_query or "").strip()
         if not q:
@@ -238,6 +246,8 @@ class AppointmentUseCases:
         phone_e164: Optional[str] = None,
     ) -> Appointment:
         ap = self.get_appointment_or_raise(appointment_id)
+        if ap.status == AppointmentStatus.CANCELLED:
+            raise UserInputError("Запись отменена. Редактирование недоступно.")
         new_service = service_id if service_id is not None else ap.service_id
         new_start = start_datetime_utc if start_datetime_utc is not None else ap.start_datetime_utc
         new_name = customer_name if customer_name is not None else ap.customer_name
@@ -267,7 +277,11 @@ class AppointmentUseCases:
 
         if new_start != ap.start_datetime_utc:
             other = self.appointment_repo.get_by_start_datetime_utc(new_start)
-            if other is not None and other.appointment_id != ap.appointment_id:
+            if (
+                other is not None
+                and other.status == AppointmentStatus.CONFIRMED
+                and other.appointment_id != ap.appointment_id
+            ):
                 raise ConflictError("Это время уже занято.")
 
         updated = replace(

@@ -106,15 +106,20 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         """
     )
 
-    # Slot-level uniqueness:
-    # Prevent multiple appointments for the same start_datetime_utc.
-    # If legacy DB already contains duplicates, creating the unique index
-    # will fail; we keep running and rely on application-level protection.
+    # Slot-level uniqueness for active records:
+    # only CONFIRMED appointments block a slot.
+    # Legacy full-slot unique index is dropped to avoid false conflicts
+    # from CANCELLED rows that keep the same start_datetime_utc.
+    try:
+        conn.execute("DROP INDEX IF EXISTS uq_appointments_slot;")
+    except sqlite3.OperationalError:
+        pass
     try:
         conn.execute(
             """
-            CREATE UNIQUE INDEX IF NOT EXISTS uq_appointments_slot
-            ON appointments(start_datetime_utc);
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_appointments_slot_confirmed
+            ON appointments(start_datetime_utc)
+            WHERE status='confirmed';
             """
         )
     except sqlite3.IntegrityError:
@@ -618,11 +623,11 @@ class AppointmentRepository:
             row = conn.execute(
                 """
                 SELECT * FROM appointments
-                WHERE start_datetime_utc=?
+                WHERE start_datetime_utc=? AND status=?
                 ORDER BY created_at ASC
                 LIMIT 1
                 """,
-                (start_datetime_utc,),
+                (start_datetime_utc, AppointmentStatus.CONFIRMED.value),
             ).fetchone()
             return _appointment_from_row(row)
 

@@ -3,9 +3,9 @@ from __future__ import annotations
 from datetime import date, timedelta
 
 from aiogram import F, Router
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from app.application.admin_ops_uc import AdminOpsUseCases
@@ -24,6 +24,8 @@ from app.presentation.callback.nav_callbacks import (
     build_admin_month,
     build_admin_month_date,
     build_admin_open,
+    build_admin_active,
+    build_admin_active_page,
     build_admin_blacklist_from_appointment,
     build_admin_cancelled_page,
     build_admin_records,
@@ -36,6 +38,7 @@ from app.presentation.callback.nav_callbacks import (
     build_admin_ops_blacklist,
     build_admin_ops_blacklist_add,
     build_admin_ops_blacklist_deactivate,
+    build_admin_ops_blacklist_open,
     build_admin_day_toggle,
     build_admin_day_edit,
     build_admin_move_start,
@@ -46,6 +49,7 @@ from app.presentation.callback.nav_callbacks import (
     build_admin_ops_salon_toggle,
     build_admin_ops_schedule,
     build_admin_ops_schedule_edit,
+    build_admin_ops_schedule_slot_step,
     build_admin_ops_service_delete,
     build_admin_ops_service_add,
     build_admin_ops_service_deactivate,
@@ -56,15 +60,30 @@ from app.presentation.callback.nav_callbacks import (
     parse_admin,
 )
 from app.presentation.fsm.states import AdminStates
+from app.presentation.keyboards.admin_reply_kb import (
+    BTN_ADMIN_HOME,
+    BTN_ADMIN_TO_CLIENT,
+    admin_reply_keyboard,
+)
+from app.presentation.keyboards.main_menu_kb import main_menu_reply_keyboard
 
 router = Router(name="admin")
+
+# Подсказка при ошибке ввода в FSM админки (команды /cancel и /start обрабатываются отдельно, раньше F.text).
+_ADMIN_FSM_TIME_HINT = (
+    "\n\nПовторите ввод или отправьте /cancel для выхода из режима."
+)
 
 
 def _is_admin(user_id: int | None, settings: Settings) -> bool:
     return user_id is not None and user_id in set(settings.admin_ids)
 
 
-def _month_keyboard(month_shift: int = 0) -> InlineKeyboardBuilder:
+def _month_keyboard(
+    month_shift: int = 0,
+    is_day_closed_fn=None,
+    is_short_day_fn=None,
+) -> InlineKeyboardBuilder:
     today = date.today()
     start = today + timedelta(days=month_shift * 30)
     if start < today:
@@ -82,13 +101,36 @@ def _month_keyboard(month_shift: int = 0) -> InlineKeyboardBuilder:
         callback_data="a1|noop",
     )
     b.button(text="»", callback_data=build_admin_month(month_shift + 1))
+    for wd in ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"):
+        b.button(text=wd, callback_data="a1|noop")
+
+    leading_pad = start.weekday()
+    for _ in range(leading_pad):
+        b.button(text="·", callback_data="a1|noop")
 
     for i in range(30):
         d = start + timedelta(days=i)
         ymd = d.strftime("%Y%m%d")
-        b.button(text=d.strftime("%d.%m"), callback_data=build_admin_month_date(ymd))
+        label = d.strftime("%d")
+        try:
+            if callable(is_day_closed_fn) and is_day_closed_fn(ymd):
+                label = f"🚫{label}"
+            elif callable(is_short_day_fn) and is_short_day_fn(ymd):
+                label = f"◔{label}"
+        except Exception:
+            pass
+        b.button(text=label, callback_data=build_admin_month_date(ymd))
     b.button(text="« Меню", callback_data=build_admin_home())
-    b.adjust(3, 5, 5, 5, 5, 5, 5, 1)
+    grid_cells = leading_pad + 30
+    rows = grid_cells // 7
+    rem = grid_cells % 7
+    adjust_pattern: list[int] = [3, 7]
+    if rows > 0:
+        adjust_pattern.extend([7] * rows)
+    if rem:
+        adjust_pattern.append(rem)
+    adjust_pattern.append(1)
+    b.adjust(*adjust_pattern)
     return b
 
 
@@ -131,6 +173,7 @@ def _slots_for_schedule(open_hhmm: str, close_hhmm: str, step: int) -> list[str]
 def _home_keyboard() -> InlineKeyboardBuilder:
     b = InlineKeyboardBuilder()
     b.button(text="Записи", callback_data=build_admin_records())
+    b.button(text="Активные записи", callback_data=build_admin_active())
     b.button(text="Отменённые", callback_data=build_admin_cancelled())
     b.button(text="Поиск", callback_data=build_admin_search())
     b.button(text="Расписание", callback_data=build_admin_ops_schedule())
@@ -286,15 +329,67 @@ def _split_answer(text: str, limit: int = 3800) -> list[str]:
 
 
 @router.message(Command("admin"))
-async def admin_entry(message: Message, settings: Settings) -> None:
+async def admin_entry(message: Message, state: FSMContext, settings: Settings) -> None:
     uid = message.from_user.id if message.from_user else None
     if not _is_admin(uid, settings):
         await message.answer("Недостаточно прав.")
         return
+    await state.clear()
+    await message.answer("Админ: записи", reply_markup=admin_reply_keyboard())
+    await message.answer("Выберите раздел:", reply_markup=_home_keyboard().as_markup())
+
+
+@router.message(F.text == BTN_ADMIN_HOME)
+async def admin_reply_menu_button(
+    message: Message,
+    state: FSMContext,
+    settings: Settings,
+) -> None:
+    uid = message.from_user.id if message.from_user else None
+    if not _is_admin(uid, settings):
+        return
+    await state.clear()
+    await message.answer("Админ: записи", reply_markup=admin_reply_keyboard())
+    await message.answer("Выберите раздел:", reply_markup=_home_keyboard().as_markup())
+
+
+@router.message(Command("cancel"), StateFilter(AdminStates))
+async def admin_fsm_cancel(message: Message, state: FSMContext, settings: Settings) -> None:
+    uid = message.from_user.id if message.from_user else None
+    if not _is_admin(uid, settings):
+        await state.clear()
+        return
+    await state.clear()
     await message.answer(
-        "Админ: записи",
-        reply_markup=_home_keyboard().as_markup(),
+        "Ввод отменён. /admin — меню администратора.",
+        reply_markup=admin_reply_keyboard(),
     )
+
+
+@router.message(Command("start"), StateFilter(AdminStates))
+async def admin_fsm_exit_to_client_menu(message: Message, state: FSMContext, settings: Settings) -> None:
+    uid = message.from_user.id if message.from_user else None
+    if not _is_admin(uid, settings):
+        await state.clear()
+        return
+    await state.clear()
+    try:
+        await message.answer("\u200b", reply_markup=ReplyKeyboardRemove())
+    except Exception:
+        pass
+    await message.answer(
+        "Главное меню.",
+        reply_markup=main_menu_reply_keyboard(),
+    )
+
+
+@router.message(F.text == BTN_ADMIN_TO_CLIENT)
+async def admin_goto_client_menu(message: Message, state: FSMContext, settings: Settings) -> None:
+    uid = message.from_user.id if message.from_user else None
+    if not _is_admin(uid, settings):
+        return
+    # Тот же путь, что и Command("start") в AdminStates — без дублирования логики.
+    await admin_fsm_exit_to_client_menu(message, state, settings)
 
 
 @router.callback_query(F.data.startswith("a1"))
@@ -320,6 +415,23 @@ async def admin_callback(
         return
 
     await state.clear()
+    try:
+        await callback.message.answer("\u200b", reply_markup=admin_reply_keyboard())
+    except Exception:
+        pass
+
+    def _is_short_day(ymd: str) -> bool:
+        try:
+            ov = admin_ops_uc.get_day_override(ymd)
+        except Exception:
+            return False
+        if ov is None or bool(getattr(ov, "is_closed", False)):
+            return False
+        return (
+            getattr(ov, "open_time_hhmm", None) is not None
+            or getattr(ov, "close_time_hhmm", None) is not None
+            or getattr(ov, "slot_minutes", None) is not None
+        )
 
     if action == "home":
         await callback.message.answer(
@@ -329,20 +441,20 @@ async def admin_callback(
         return
 
     if action == "noop":
-        await callback.answer("Выберите дату в календаре", show_alert=False)
+        # callback уже подтверждён в _safe_cq_answer — повторный answer даёт ошибку API
         return
 
     if action == "td":
         await callback.message.answer(
-            "Календарь записей:",
-            reply_markup=_month_keyboard(0).as_markup(),
+            "Календарь записей:\n🚫 — выходной\n◔ — сокращённый день",
+            reply_markup=_month_keyboard(0, admin_ops_uc.is_day_closed, _is_short_day).as_markup(),
         )
         return
 
     if action == "cal":
         await callback.message.answer(
-            "Календарь записей:",
-            reply_markup=_month_keyboard(0).as_markup(),
+            "Календарь записей:\n🚫 — выходной\n◔ — сокращённый день",
+            reply_markup=_month_keyboard(0, admin_ops_uc.is_day_closed, _is_short_day).as_markup(),
         )
         return
 
@@ -350,15 +462,15 @@ async def admin_callback(
         ymd = parts[0]
         await callback.message.answer(
             f"Откройте дату {_fmt_ymd(ymd)} через раздел «Записи».",
-            reply_markup=_month_keyboard(0).as_markup(),
+            reply_markup=_month_keyboard(0, admin_ops_uc.is_day_closed, _is_short_day).as_markup(),
         )
         return
 
     if action == "rec":
         await _safe_edit_or_answer(
             callback,
-            "Календарь записей:",
-            reply_markup=_month_keyboard(0).as_markup(),
+            "Календарь записей:\n🚫 — выходной\n◔ — сокращённый день",
+            reply_markup=_month_keyboard(0, admin_ops_uc.is_day_closed, _is_short_day).as_markup(),
         )
         return
 
@@ -373,11 +485,23 @@ async def admin_callback(
         )
         return
 
+    if action == "ac":
+        items = appointment_uc.admin_list_active()
+        await _send_appointment_list(
+            callback.message,
+            items,
+            "Активные записи",
+            active_list=True,
+            page=0,
+        )
+        return
+
     if action == "ops_sc":
         sc = admin_ops_uc.get_schedule()
         b = InlineKeyboardBuilder()
         b.button(text="Изменить начало", callback_data=build_admin_ops_schedule_edit("open"))
         b.button(text="Изменить конец", callback_data=build_admin_ops_schedule_edit("close"))
+        b.button(text="Шаг слотов", callback_data=build_admin_ops_schedule_slot_step())
         b.button(text="Календарь по дням", callback_data=build_admin_records())
         b.button(text="« Меню", callback_data=build_admin_home())
         b.adjust(1)
@@ -449,17 +573,40 @@ async def admin_callback(
         field = parts[0]
         if field == "open":
             await state.set_state(AdminStates.schedule_open)
-            await callback.message.answer("Введите новое начало дня (HH:MM), например 08:00")
+            await callback.message.answer(
+                "⚠️ <b>Внимание</b>\n\n"
+                "Изменение общего начала дня приведёт все индивидуальные настройки "
+                "времени начала по конкретным дням к одному формату с новым общим "
+                "значением (переопределения начала по дням будут сброшены).\n\n"
+                "Введите новое начало дня (HH:MM, минуты только :00 или :30), например 09:00"
+            )
             return
         if field == "close":
             await state.set_state(AdminStates.schedule_close)
-            await callback.message.answer("Введите новый конец дня (HH:MM), например 20:00")
+            await callback.message.answer(
+                "⚠️ <b>Внимание</b>\n\n"
+                "Изменение общего конца дня приведёт все индивидуальные настройки "
+                "времени окончания по конкретным дням к одному формату с новым общим "
+                "значением (переопределения конца по дням будут сброшены).\n\n"
+                "Введите новый конец дня (HH:MM, минуты только :00 или :30), например 18:30"
+            )
             return
         if field == "step":
             await callback.message.answer(
                 "Шаг слотов определяется длительностью услуги в каталоге."
             )
             return
+
+    if action == "ops_sc_gss":
+        await state.set_state(AdminStates.schedule_step)
+        await callback.message.answer(
+            "⚠️ <b>Внимание</b>\n\n"
+            "Изменение общего шага слотов приведёт все индивидуальные шаги слотов "
+            "для конкретных дней к одному формату с новым общим значением "
+            "(отдельные переопределения шага по дням будут сброшены).\n\n"
+            "Введите шаг слотов (мин, кратно 30, например 30 или 60):"
+        )
+        return
 
     if action == "ops_sv":
         items = admin_ops_uc.list_services()
@@ -555,19 +702,25 @@ async def admin_callback(
     if action == "ops_sv_ed" and len(parts) >= 2:
         service_id = parts[0]
         field = parts[1]
-        await state.update_data(ops_service_id=service_id)
         if field == "name":
             await state.set_state(AdminStates.service_edit_name)
+            await state.update_data(ops_service_id=service_id)
             await callback.message.answer("Введите новое название услуги:")
             return
         if field == "duration":
             await state.set_state(AdminStates.service_edit_duration)
-            await callback.message.answer("Введите новую длительность в минутах:")
+            await state.update_data(ops_service_id=service_id)
+            await callback.message.answer(
+                "Введите новую длительность в минутах (кратно 30, например 60):"
+            )
             return
         if field == "price":
             await state.set_state(AdminStates.service_edit_price)
+            await state.update_data(ops_service_id=service_id)
             await callback.message.answer("Введите новую цену (текстом):")
             return
+        await callback.message.answer("Неизвестное поле редактирования услуги.")
+        return
 
     if action == "ops_bl":
         items = admin_ops_uc.list_blacklist()
@@ -577,7 +730,7 @@ async def admin_callback(
             for entry in active[:30]:
                 b.button(
                     text=f"❌ {_blacklist_line(entry)}"[:60],
-                    callback_data=build_admin_ops_blacklist_deactivate(entry.entry_id),
+                    callback_data=build_admin_ops_blacklist_open(entry.entry_id),
                 )
         b.button(text="➕ Добавить", callback_data=build_admin_ops_blacklist_add())
         b.button(text="« Меню", callback_data=build_admin_home())
@@ -612,6 +765,15 @@ async def admin_callback(
         await callback.message.answer("Запись в blacklist деактивирована.")
         return
 
+    if action == "ops_bl_o" and parts:
+        entry_id = parts[0]
+        entry = next((x for x in admin_ops_uc.list_blacklist() if x.entry_id == entry_id), None)
+        if entry is None:
+            await callback.message.answer("Запись blacklist не найдена.")
+            return
+        await _send_blacklist_entry_card(callback.message, entry)
+        return
+
     if action == "sr":
         await state.set_state(AdminStates.search_query)
         await callback.message.answer(
@@ -631,8 +793,8 @@ async def admin_callback(
                 shift = 0
         await _safe_edit_or_answer(
             callback,
-            "Календарь записей:",
-            reply_markup=_month_keyboard(shift).as_markup(),
+            "Календарь записей:\n🚫 — выходной\n◔ — сокращённый день",
+            reply_markup=_month_keyboard(shift, admin_ops_uc.is_day_closed, _is_short_day).as_markup(),
         )
         return
 
@@ -702,22 +864,31 @@ async def admin_callback(
         await state.update_data(day_ymd=ymd)
         if field == "open":
             await state.set_state(AdminStates.day_schedule_open)
-            await callback.message.answer("Введите начало дня для этой даты (HH:MM):")
+            await callback.message.answer(
+                "Введите начало дня для этой даты (HH:MM, минуты только :00 или :30):"
+            )
             return
         if field == "close":
             await state.set_state(AdminStates.day_schedule_close)
-            await callback.message.answer("Введите конец дня для этой даты (HH:MM):")
+            await callback.message.answer(
+                "Введите конец дня для этой даты (HH:MM, минуты только :00 или :30):"
+            )
             return
         if field == "step":
             await state.set_state(AdminStates.day_schedule_step)
-            await callback.message.answer("Введите шаг слотов для этой даты (мин):")
+            await callback.message.answer(
+                "Введите шаг слотов для этой даты (мин, кратно 30):"
+            )
             return
 
     if action == "ts" and len(parts) >= 2:
-        await callback.answer("Записи на это время нет", show_alert=False)
+        # callback уже подтверждён в _safe_cq_answer
         return
 
     if action == "bk":
+        if not parts:
+            await callback.message.answer("Команда устарела. Откройте /admin заново.")
+            return
         if parts == ["hm"]:
             await callback.message.answer(
                 "Админ: записи",
@@ -725,8 +896,8 @@ async def admin_callback(
             )
         elif parts == ["td"]:
             await callback.message.answer(
-                "Календарь записей:",
-                reply_markup=_month_keyboard(0).as_markup(),
+                "Календарь записей:\n🚫 — выходной\n◔ — сокращённый день",
+                reply_markup=_month_keyboard(0, admin_ops_uc.is_day_closed, _is_short_day).as_markup(),
             )
         elif parts == ["cn"]:
             items = appointment_uc.admin_list_cancelled()
@@ -741,7 +912,7 @@ async def admin_callback(
             ymd = parts[1]
             await callback.message.answer(
                 f"Откройте дату {_fmt_ymd(ymd)} через раздел «Записи».",
-                reply_markup=_month_keyboard(0).as_markup(),
+                reply_markup=_month_keyboard(0, admin_ops_uc.is_day_closed, _is_short_day).as_markup(),
             )
         return
 
@@ -752,7 +923,10 @@ async def admin_callback(
         except AppError as e:
             await callback.message.answer(error_to_user_message(e))
             return
-        await _send_appointment_card(callback.message, ap, settings)
+        if ap.status == AppointmentStatus.CANCELLED:
+            await _send_cancelled_appointment_card(callback.message, ap, settings)
+        else:
+            await _send_appointment_card(callback.message, ap, settings)
         return
 
     if action == "x" and parts:
@@ -808,6 +982,21 @@ async def admin_callback(
             items,
             "Отменённые записи",
             include_cancelled_actions=True,
+            page=page,
+        )
+        return
+
+    if action == "acp" and parts:
+        try:
+            page = max(int(parts[0]), 0)
+        except Exception:
+            page = 0
+        items = appointment_uc.admin_list_active()
+        await _send_appointment_list(
+            callback.message,
+            items,
+            "Активные записи",
+            active_list=True,
             page=page,
         )
         return
@@ -974,6 +1163,7 @@ async def _send_appointment_list(
     items: list[Appointment],
     title: str,
     include_cancelled_actions: bool = False,
+    active_list: bool = False,
     page: int = 0,
 ) -> None:
     if not items:
@@ -991,6 +1181,12 @@ async def _send_appointment_list(
     header = f"<b>{title}</b> ({len(items)})\nСтраница {page + 1}/{total_pages}\n"
     if include_cancelled_actions:
         await message.answer(header.strip())
+    elif active_list:
+        def _row(a: Appointment) -> str:
+            return f"• {format_slot_utc_for_user(a.start_datetime_utc)} — {a.service_id} — {a.customer_name} — {a.phone_e164}"
+        intro = f"<b>{title}</b> ({len(items)})\nСтраница {page + 1}/{total_pages}\n\nВыберите запись"
+        text = intro + "\n\n" + "\n".join(_row(a) for a in page_items)
+        await message.answer(text)
     else:
         def _row(a: Appointment) -> str:
             return f"• {format_slot_utc_for_user(a.start_datetime_utc)} — {a.service_id} — {a.customer_name} — {a.phone_e164}"
@@ -1002,19 +1198,21 @@ async def _send_appointment_list(
         if include_cancelled_actions:
             line = (
                 f"{format_slot_utc_for_user(ap.start_datetime_utc)} | "
-                f"{ap.service_id} | {ap.customer_name} | {ap.phone_e164} | blacklist"
+                f"{ap.service_id} | {ap.customer_name} | {ap.phone_e164}"
             )
             b.button(
                 text=line[:64],
-                callback_data=build_admin_blacklist_from_appointment(ap.appointment_id),
+                callback_data=build_admin_open(ap.appointment_id),
             )
         else:
             b.button(text=f"Открыть · {_btn_line(ap)}", callback_data=build_admin_open(ap.appointment_id))
     if total_pages > 1:
+        prev_cb = build_admin_active_page(page - 1) if active_list else build_admin_cancelled_page(page - 1)
+        next_cb = build_admin_active_page(page + 1) if active_list else build_admin_cancelled_page(page + 1)
         if page > 0:
-            b.button(text="« Пред.", callback_data=build_admin_cancelled_page(page - 1))
+            b.button(text="« Пред.", callback_data=prev_cb)
         if page < total_pages - 1:
-            b.button(text="След. »", callback_data=build_admin_cancelled_page(page + 1))
+            b.button(text="След. »", callback_data=next_cb)
     b.button(text="« Меню", callback_data=build_admin_home())
     b.adjust(1)
     await message.answer(("Записи:" if include_cancelled_actions else "Открыть запись:"), reply_markup=b.as_markup())
@@ -1034,6 +1232,44 @@ async def _send_appointment_card(
     await message.answer(_card_text(ap, settings), reply_markup=b.as_markup())
 
 
+async def _send_cancelled_appointment_card(
+    message: Message,
+    ap: Appointment,
+    settings: Settings,
+) -> None:
+    b = InlineKeyboardBuilder()
+    b.button(text="🚫 В blacklist", callback_data=build_admin_blacklist_from_appointment(ap.appointment_id))
+    b.button(text="« К отменённым", callback_data=build_admin_cancelled())
+    b.adjust(1)
+    await message.answer(_card_text(ap, settings), reply_markup=b.as_markup())
+
+
+def _blacklist_card_text(entry: BlacklistEntry) -> str:
+    who = f"user_id={entry.user_id}" if entry.user_id is not None else "user_id=—"
+    phone = entry.phone_e164 or "—"
+    reason = entry.reason or "—"
+    status = "active" if entry.is_active else "inactive"
+    return (
+        "<b>Blacklist entry</b>\n\n"
+        f"Статус: {status}\n"
+        f"👤 {who}\n"
+        f"📞 {phone}\n"
+        f"📝 {reason}"
+    )
+
+
+async def _send_blacklist_entry_card(
+    message: Message,
+    entry: BlacklistEntry,
+) -> None:
+    b = InlineKeyboardBuilder()
+    if entry.is_active:
+        b.button(text="✅ Разблокировать", callback_data=build_admin_ops_blacklist_deactivate(entry.entry_id))
+    b.button(text="« К blacklist", callback_data=build_admin_ops_blacklist())
+    b.adjust(1)
+    await message.answer(_blacklist_card_text(entry), reply_markup=b.as_markup())
+
+
 @router.message(AdminStates.search_query, F.text)
 async def admin_search_run(
     message: Message,
@@ -1051,7 +1287,7 @@ async def admin_search_run(
     await _send_appointment_list(
         message,
         items,
-        f"Поиск: {q}",
+        f"Поиск: {q}" if q else "Поиск",
     )
 
 
@@ -1070,10 +1306,13 @@ async def admin_schedule_set_open(
     try:
         admin_ops_uc.update_schedule(open_time_hhmm=value)
     except AppError as e:
-        await message.answer(error_to_user_message(e))
+        await message.answer(error_to_user_message(e) + _ADMIN_FSM_TIME_HINT)
         return
     await state.clear()
-    await message.answer("Начало дня обновлено.")
+    await message.answer(
+        "Начало дня обновлено.\n"
+        "Индивидуальные времена начала по дням приведены к общему формату."
+    )
 
 
 @router.message(AdminStates.schedule_close, F.text)
@@ -1091,10 +1330,13 @@ async def admin_schedule_set_close(
     try:
         admin_ops_uc.update_schedule(close_time_hhmm=value)
     except AppError as e:
-        await message.answer(error_to_user_message(e))
+        await message.answer(error_to_user_message(e) + _ADMIN_FSM_TIME_HINT)
         return
     await state.clear()
-    await message.answer("Конец дня обновлён.")
+    await message.answer(
+        "Конец дня обновлён.\n"
+        "Индивидуальные времена окончания по дням приведены к общему формату."
+    )
 
 
 @router.message(AdminStates.schedule_step, F.text)
@@ -1111,15 +1353,19 @@ async def admin_schedule_set_step(
     value = (message.text or "").strip()
     try:
         step = int(value)
-        admin_ops_uc.update_schedule(slot_minutes=step)
+        admin_ops_uc.update_schedule_slot_unify_day_overrides(step)
     except ValueError:
-        await message.answer("Введите целое число минут.")
+        await message.answer("Введите целое число минут." + _ADMIN_FSM_TIME_HINT)
         return
     except AppError as e:
-        await message.answer(error_to_user_message(e))
+        await message.answer(error_to_user_message(e) + _ADMIN_FSM_TIME_HINT)
         return
     await state.clear()
-    await message.answer("Шаг слотов обновлён.")
+    await message.answer(
+        "Общий шаг слотов обновлён: "
+        f"{_fmt_duration_minutes(step)}.\n"
+        "Индивидуальные шаги по дням приведены к этому же формату."
+    )
 
 
 @router.message(AdminStates.day_schedule_open, F.text)
@@ -1142,7 +1388,7 @@ async def admin_day_schedule_set_open(
     try:
         admin_ops_uc.update_day_schedule(ymd, open_time_hhmm=(message.text or "").strip())
     except AppError as e:
-        await message.answer(error_to_user_message(e))
+        await message.answer(error_to_user_message(e) + _ADMIN_FSM_TIME_HINT)
         return
     await state.clear()
     await message.answer("Начало дня обновлено.")
@@ -1168,7 +1414,7 @@ async def admin_day_schedule_set_close(
     try:
         admin_ops_uc.update_day_schedule(ymd, close_time_hhmm=(message.text or "").strip())
     except AppError as e:
-        await message.answer(error_to_user_message(e))
+        await message.answer(error_to_user_message(e) + _ADMIN_FSM_TIME_HINT)
         return
     await state.clear()
     await message.answer("Конец дня обновлён.")
@@ -1194,10 +1440,10 @@ async def admin_day_schedule_set_step(
     try:
         admin_ops_uc.update_day_schedule(ymd, slot_minutes=int((message.text or "").strip()))
     except ValueError:
-        await message.answer("Введите целое число минут.")
+        await message.answer("Введите целое число минут." + _ADMIN_FSM_TIME_HINT)
         return
     except AppError as e:
-        await message.answer(error_to_user_message(e))
+        await message.answer(error_to_user_message(e) + _ADMIN_FSM_TIME_HINT)
         return
     await state.clear()
     await message.answer("Шаг слотов для дня обновлён.")
@@ -1245,10 +1491,12 @@ async def admin_service_add(
         duration = int(dur_raw)
         admin_ops_uc.add_service(name, duration, price)
     except ValueError:
-        await message.answer("Длительность должна быть числом. Пример: Стрижка | 60 | 1500 ₽")
+        await message.answer(
+            "Длительность должна быть числом. Пример: Стрижка | 60 | 1500 ₽" + _ADMIN_FSM_TIME_HINT
+        )
         return
     except AppError as e:
-        await message.answer(error_to_user_message(e))
+        await message.answer(error_to_user_message(e) + _ADMIN_FSM_TIME_HINT)
         return
     await state.clear()
     await message.answer("Услуга добавлена.")
@@ -1301,10 +1549,10 @@ async def admin_service_edit_duration(
         duration = int((message.text or "").strip())
         admin_ops_uc.update_service(service_id, duration_minutes=duration)
     except ValueError:
-        await message.answer("Введите целое число минут.")
+        await message.answer("Введите целое число минут." + _ADMIN_FSM_TIME_HINT)
         return
     except AppError as e:
-        await message.answer(error_to_user_message(e))
+        await message.answer(error_to_user_message(e) + _ADMIN_FSM_TIME_HINT)
         return
     await state.clear()
     await message.answer("Длительность услуги обновлена.")

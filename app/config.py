@@ -11,6 +11,9 @@ class Settings:
     admin_ids: list[int]
     services: list[str]
 
+    # тест: разрешить пользователю несколько активных CONFIRMED (слоты по-прежнему защищены)
+    allow_multiple_active_bookings: bool
+
     # настройки слотов (пока простые)
     slot_duration_minutes: int
     max_days_ahead: int
@@ -66,10 +69,14 @@ def load_settings() -> Settings:
         default_dur,
     )
 
+    allow_multi = (os.getenv("ALLOW_MULTIPLE_ACTIVE_BOOKINGS", "") or "").strip().lower()
+    allow_multiple_active_bookings = allow_multi in ("1", "true", "yes", "on")
+
     return Settings(
         bot_token=bot_token,
         admin_ids=admin_ids,
         services=services,
+        allow_multiple_active_bookings=allow_multiple_active_bookings,
         slot_duration_minutes=slot_duration_minutes,
         max_days_ahead=int(os.getenv("MAX_DAYS_AHEAD", 7)),
         salon_address=os.getenv("SALON_ADDRESS", "Адрес уточняйте у администратора.").strip()

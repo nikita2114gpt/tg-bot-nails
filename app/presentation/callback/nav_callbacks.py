@@ -37,6 +37,14 @@ def build_admin_cancelled() -> str:
     return "a1|cn"
 
 
+def build_admin_active() -> str:
+    return "a1|ac"
+
+
+def build_admin_active_page(page: int) -> str:
+    return f"a1|acp|{page}"
+
+
 def build_admin_search() -> str:
     return "a1|sr"
 
@@ -107,6 +115,11 @@ def build_admin_ops_schedule_edit(field: str) -> str:
     return f"a1|ops_sc_ed|{field}"
 
 
+def build_admin_ops_schedule_slot_step() -> str:
+    """Глобальный шаг слотов (общее расписание)."""
+    return "a1|ops_sc_gss"
+
+
 def build_admin_ops_schedule_service_step_menu() -> str:
     return "a1|ops_sc_ssm"
 
@@ -173,6 +186,10 @@ def build_admin_ops_blacklist_add() -> str:
 
 def build_admin_ops_blacklist_deactivate(entry_id: str) -> str:
     return f"a1|ops_bl_off|{entry_id}"
+
+
+def build_admin_ops_blacklist_open(entry_id: str) -> str:
+    return f"a1|ops_bl_o|{entry_id}"
 
 
 def build_admin_blacklist_from_appointment(appt_id: str) -> str:

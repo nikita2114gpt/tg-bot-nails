@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-from aiogram import F, Router
-from aiogram.filters import Command
+from aiogram import Router
+from aiogram.filters import Command, StateFilter
 from aiogram.types import Message
+
+from app.presentation.fsm.states import AdminStates
 from aiogram.types.error_event import ErrorEvent
 
 router = Router(name="common")
 
 
-@router.message(Command("help"))
+@router.message(Command("help"), ~StateFilter(AdminStates))
 async def help_handler(message: Message) -> None:
     """Minimal help for MVP v2."""
 

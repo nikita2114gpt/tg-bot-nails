@@ -1,18 +1,24 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
+from html import escape
 
 from aiogram import F, Router
+from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from app.application.admin_ops_uc import AdminOpsUseCases
-from app.application.booking_uc import BookingUseCases
+from app.application.booking_uc import (
+    BOOKING_SLOT_CONFLICT_MESSAGE,
+    BookingUseCases,
+)
 from app.config import Settings
-from app.core.errors import AppError, error_to_user_message
-from app.domain.enums import DraftStep
+from app.core.errors import AppError, ConflictError, error_to_user_message
+from app.domain.enums import AppointmentStatus, DraftStep
 from app.presentation.callback.booking_callbacks import build_callback, parse_callback_data
+from app.presentation.fsm.admin_guard import is_active_admin_fsm
 from app.presentation.fsm.states import BookingStates
 from app.presentation.keyboards.booking_kb import (
     contact_keyboard,
@@ -23,6 +29,86 @@ from app.presentation.keyboards.booking_kb import (
 )
 
 router = Router()
+_CONTACT_PROMPT_MSG_ID_KEY = "contact_prompt_message_id"
+_CLIENT_CALENDAR_LEGEND = "🚫 — выходной\n🔒 — занято"
+_TIME_SLOT_LEGEND = "🔒 — занято"
+
+
+def _calendar_holiday_and_fully_busy_sets(
+    booking_uc: BookingUseCases,
+    admin_ops_uc: AdminOpsUseCases,
+    settings: Settings,
+    dates: list[str],
+    service_id: str | None,
+) -> tuple[set[str], set[str]]:
+    holiday = {d for d in dates if admin_ops_uc.is_day_closed(d)}
+    busy = {
+        d
+        for d in dates
+        if not admin_ops_uc.is_day_closed(d)
+        and _is_day_fully_busy(booking_uc, admin_ops_uc, settings, d, service_id)
+    }
+    return holiday, busy
+
+
+async def _force_remove_contact_keyboard(
+    message_or_callback: Message | CallbackQuery | None,
+) -> None:
+    """Убирает reply keyboard (в т.ч. «Отправить контакт»); безопасно при отсутствии клавиатуры."""
+    msg: Message | None = None
+    if isinstance(message_or_callback, CallbackQuery):
+        msg = message_or_callback.message
+    elif isinstance(message_or_callback, Message):
+        msg = message_or_callback
+    if msg is None:
+        return
+    try:
+        # zws может быть отвергнут Telegram как пустой текст.
+        # Отправляем техническое сообщение с remove и сразу удаляем его.
+        sent = await msg.bot.send_message(
+            chat_id=msg.chat.id,
+            text=".",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        try:
+            await sent.delete()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+async def _clear_stale_contact_prompt_message(
+    state: FSMContext,
+    message_or_callback: Message | CallbackQuery | None,
+) -> None:
+    """Удаляет последнее техническое сообщение contact-prompt, если оно запомнено в FSM."""
+    msg: Message | None = None
+    if isinstance(message_or_callback, CallbackQuery):
+        msg = message_or_callback.message
+    elif isinstance(message_or_callback, Message):
+        msg = message_or_callback
+    if msg is None:
+        return
+    data = await state.get_data()
+    prompt_id = data.get(_CONTACT_PROMPT_MSG_ID_KEY)
+    if not isinstance(prompt_id, int):
+        return
+    try:
+        await msg.bot.delete_message(chat_id=msg.chat.id, message_id=prompt_id)
+    except Exception:
+        pass
+    await state.update_data(**{_CONTACT_PROMPT_MSG_ID_KEY: None})
+
+
+async def _send_contact_prompt(
+    state: FSMContext,
+    message: Message,
+    text: str,
+) -> None:
+    """Показывает prompt контакта и запоминает message_id для последующей очистки."""
+    sent = await message.answer(text, reply_markup=contact_keyboard())
+    await state.update_data(**{_CONTACT_PROMPT_MSG_ID_KEY: sent.message_id})
 
 
 def _available_dates(settings: Settings, admin_ops_uc: AdminOpsUseCases, count: int = 3) -> list[str]:
@@ -166,24 +252,21 @@ async def _handle_action_svc(
     )
     await state.set_state(BookingStates.choose_date)
     dates = _available_dates(settings, admin_ops_uc)
-    closed_dates = {
-        d
-        for d in dates
-        if _is_day_fully_busy(
-            booking_uc=booking_uc,
-            admin_ops_uc=admin_ops_uc,
-            settings=settings,
-            ymd=d,
-            service_id=service_id,
-        )
-    }
+    holiday_dates, busy_dates = _calendar_holiday_and_fully_busy_sets(
+        booking_uc, admin_ops_uc, settings, dates, service_id
+    )
     if not dates:
         await _safe_edit_text(callback, "Нет доступных дат для записи. Обратитесь к администратору.")
         return
     await _safe_edit_text(
         callback,
-        "Выберите дату:",
-        reply_markup=date_keyboard(draft.draft_id, dates, closed_dates=closed_dates),
+        f"Когда вам удобно? 📅\n{_CLIENT_CALENDAR_LEGEND}",
+        reply_markup=date_keyboard(
+            draft.draft_id,
+            dates,
+            closed_dates=holiday_dates,
+            fully_busy_dates=busy_dates,
+        ),
     )
 
 
@@ -201,10 +284,27 @@ async def _handle_action_date(
     if draft is None or draft.user_id != user_id or draft.step == DraftStep.CANCELLED:
         if callback.message is not None:
             await callback.message.answer("Сессия устарела. Напишите /start")
+        await _force_remove_contact_keyboard(callback.message)
         await state.clear()
         return
 
     if draft.step != DraftStep.CHOOSE_DATE:
+        skip_notice = False
+        if (date_value or "").startswith("x_"):
+            pd = (date_value or "")[2:]
+            if (
+                len(pd) == 8
+                and pd.isdigit()
+                and not admin_ops_uc.is_day_closed(pd)
+                and _is_day_fully_busy(
+                    booking_uc,
+                    admin_ops_uc,
+                    settings,
+                    pd,
+                    draft.service_id,
+                )
+            ):
+                skip_notice = True
         await _recover_to_choose_date_from_stale(
             callback=callback,
             state=state,
@@ -213,32 +313,44 @@ async def _handle_action_date(
             settings=settings,
             user_id=user_id,
             draft_id=draft_id,
+            skip_session_changed_notice=skip_notice,
         )
         return
 
     picked_date = date_value
     if (date_value or "").startswith("x_"):
         picked_date = (date_value or "")[2:]
+        # Закрытые/технические ячейки календаря не двигают сценарий и не перерисовывают экран.
         if len(picked_date) != 8 or not picked_date.isdigit():
-            await _safe_edit_text(callback, "Выберите день в календаре.")
+            return
+        if admin_ops_uc.is_day_closed(picked_date):
+            return
+        if _is_day_fully_busy(
+            booking_uc,
+            admin_ops_uc,
+            settings,
+            picked_date,
+            draft.service_id,
+        ):
             return
     if admin_ops_uc.is_day_closed(picked_date):
         dates = _available_dates(settings, admin_ops_uc)
-        closed_dates = {
-            d
-            for d in dates
-            if _is_day_fully_busy(
-                booking_uc=booking_uc,
-                admin_ops_uc=admin_ops_uc,
-                settings=settings,
-                ymd=d,
-                service_id=(draft.service_id if draft is not None else None),
-            )
-        }
+        holiday_dates, busy_dates = _calendar_holiday_and_fully_busy_sets(
+            booking_uc,
+            admin_ops_uc,
+            settings,
+            dates,
+            (draft.service_id if draft is not None else None),
+        )
         await _safe_edit_text(
             callback,
             "Этот день закрыт для записи. Выберите рабочий день.",
-            reply_markup=date_keyboard(draft_id, dates, closed_dates=closed_dates),
+            reply_markup=date_keyboard(
+                draft_id,
+                dates,
+                closed_dates=holiday_dates,
+                fully_busy_dates=busy_dates,
+            ),
         )
         await state.set_state(BookingStates.choose_date)
         return
@@ -254,40 +366,42 @@ async def _handle_action_date(
     free_exists = any(slot not in occupied_slots for slot in times)
     if not free_exists:
         await state.set_state(BookingStates.choose_date)
+        dates_fb = _available_dates(settings, admin_ops_uc)
+        h_fb, b_fb = _calendar_holiday_and_fully_busy_sets(
+            booking_uc, admin_ops_uc, settings, dates_fb, draft.service_id
+        )
+        b_fb = b_fb | {picked_date}
         await _safe_edit_text(
             callback,
-            "На этот день свободных слотов нет. Выберите другую дату:",
+            f"На этот день свободных слотов нет. Выберите другую дату:\n{_CLIENT_CALENDAR_LEGEND}",
             reply_markup=date_keyboard(
                 draft_id,
-                _available_dates(settings, admin_ops_uc),
-                closed_dates={
-                    d
-                    for d in _available_dates(settings, admin_ops_uc)
-                    if _is_day_fully_busy(booking_uc, admin_ops_uc, settings, d, draft.service_id)
-                }
-                | {picked_date},
+                dates_fb,
+                closed_dates=h_fb,
+                fully_busy_dates=b_fb,
             ),
         )
         return
     if not times:
         await state.set_state(BookingStates.choose_date)
+        dates_nt = _available_dates(settings, admin_ops_uc)
+        h_nt, b_nt = _calendar_holiday_and_fully_busy_sets(
+            booking_uc, admin_ops_uc, settings, dates_nt, draft.service_id
+        )
         await _safe_edit_text(
             callback,
-            "Этот день закрыт для записи. Выберите другую дату:",
+            f"Этот день закрыт для записи. Выберите другую дату:\n{_CLIENT_CALENDAR_LEGEND}",
             reply_markup=date_keyboard(
                 draft_id,
-                _available_dates(settings, admin_ops_uc),
-                closed_dates={
-                    d
-                    for d in _available_dates(settings, admin_ops_uc)
-                    if _is_day_fully_busy(booking_uc, admin_ops_uc, settings, d, draft.service_id)
-                },
+                dates_nt,
+                closed_dates=h_nt,
+                fully_busy_dates=b_nt,
             ),
         )
         return
     await _safe_edit_text(
         callback,
-        "Выберите время:",
+        f"Выберите время ⏱\n{_TIME_SLOT_LEGEND}",
         reply_markup=time_keyboard(draft_id, times, occupied_slots=occupied_slots),
     )
 
@@ -306,7 +420,12 @@ async def _handle_action_time(
     if draft is None or draft.user_id != user_id:
         if callback.message is not None:
             await callback.message.answer("Сессия устарела. Напишите /start")
+        await _force_remove_contact_keyboard(callback.message)
         await state.clear()
+        return
+
+    # Занятый слот: до stale-recovery, иначе старый inline «время» уводит в recover вместо no-op.
+    if (time_value or "").startswith("x_"):
         return
 
     if draft.step != DraftStep.CHOOSE_TIME:
@@ -321,10 +440,6 @@ async def _handle_action_time(
         )
         return
 
-    if (time_value or "").startswith("x_"):
-        await _safe_edit_text(callback, "Это время уже занято. Выберите другое.")
-        return
-
     booking_uc.choose_time(
         draft_id=draft_id,
         user_id=user_id,
@@ -333,10 +448,15 @@ async def _handle_action_time(
     await state.set_state(BookingStates.enter_contact)
     # Контакт просим через ReplyKeyboardMarkup; edit_text с таким reply_markup может упасть.
     if callback.message is not None:
-        await callback.message.answer(
-            "Отправьте имя и телефон в формате:\nИмя, Телефон\n\n"
-            "Или нажмите кнопку отправки контакта.",
-            reply_markup=contact_keyboard(),
+        await _clear_stale_contact_prompt_message(state, callback)
+        await _force_remove_contact_keyboard(callback)
+        await _send_contact_prompt(
+            state=state,
+            message=callback.message,
+            text=(
+                "Отправьте имя и телефон в формате:\nИмя, Телефон\n\n"
+                "Или нажмите кнопку отправки контакта."
+            ),
         )
 
 
@@ -348,6 +468,8 @@ async def _recover_to_choose_date_from_stale(
     settings: Settings,
     user_id: int,
     draft_id: str,
+    *,
+    skip_session_changed_notice: bool = False,
 ) -> None:
     """
     Унифицированное восстановление после stale inline callback (date/time).
@@ -357,6 +479,8 @@ async def _recover_to_choose_date_from_stale(
     if draft is None or draft.user_id != user_id or draft.step == DraftStep.CANCELLED:
         if callback.message is not None:
             await callback.message.answer("Сессия устарела. Напишите /start")
+        await _clear_stale_contact_prompt_message(state, callback)
+        await _force_remove_contact_keyboard(callback.message)
         await state.clear()
         return
 
@@ -370,6 +494,7 @@ async def _recover_to_choose_date_from_stale(
     elif draft.step == DraftStep.CHOOSE_SERVICE:
         # stale callbacks from deeper steps against fresh draft:
         # безопаснее показать актуальный первый шаг без "технической" ошибки.
+        await _clear_stale_contact_prompt_message(state, callback)
         await state.set_state(BookingStates.choose_service)
         if callback.message is not None:
             await callback.message.answer(
@@ -383,31 +508,92 @@ async def _recover_to_choose_date_from_stale(
         )
         return
 
+    draft = booking_uc.draft_repo.get_by_id(draft_id)
+    await _clear_stale_contact_prompt_message(state, callback)
     await state.set_state(BookingStates.choose_date)
-    if callback.message is not None:
+    if callback.message is not None and not skip_session_changed_notice:
         await callback.message.answer(
             "Сессия изменилась, выберите дату заново.",
             reply_markup=ReplyKeyboardRemove(),
         )
     dates = _available_dates(settings, admin_ops_uc)
-    closed_dates = {
-        d
-        for d in dates
-        if _is_day_fully_busy(
-            booking_uc=booking_uc,
-            admin_ops_uc=admin_ops_uc,
-            settings=settings,
-            ymd=d,
-            service_id=(draft.service_id if draft is not None else None),
-        )
-    }
+    holiday_dates, busy_dates = _calendar_holiday_and_fully_busy_sets(
+        booking_uc,
+        admin_ops_uc,
+        settings,
+        dates,
+        (draft.service_id if draft is not None else None),
+    )
     if not dates:
         await _safe_edit_text(callback, "Нет доступных дат для записи. Обратитесь к администратору.")
         return
     await _safe_edit_text(
         callback,
-        "Выберите дату:",
-        reply_markup=date_keyboard(draft_id, dates, closed_dates=closed_dates),
+        f"Когда вам удобно? 📅\n{_CLIENT_CALENDAR_LEGEND}",
+        reply_markup=date_keyboard(
+            draft_id,
+            dates,
+            closed_dates=holiday_dates,
+            fully_busy_dates=busy_dates,
+        ),
+    )
+
+
+async def _confirm_failure_cleanup(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    await _clear_stale_contact_prompt_message(state, callback)
+    await _force_remove_contact_keyboard(callback)
+    await state.clear()
+
+
+async def _apply_confirm_success_ui(
+    callback: CallbackQuery,
+    state: FSMContext,
+    ap,
+) -> None:
+    from app.presentation.keyboards.main_menu_kb import post_confirm_reply_keyboard
+
+    await _clear_stale_contact_prompt_message(state, callback)
+    await state.set_state(BookingStates.confirm_done)
+    await _force_remove_contact_keyboard(callback)
+    success_body = _format_success_from_appointment(ap)
+    try:
+        await _safe_edit_text(callback, success_body, reply_markup=None)
+    except Exception:
+        if callback.message is not None:
+            try:
+                await callback.message.answer(success_body)
+            except Exception:
+                pass
+    if callback.message is not None:
+        try:
+            await callback.message.answer(
+                "\u200b",
+                reply_markup=post_confirm_reply_keyboard(),
+            )
+        except Exception:
+            pass
+
+
+def _format_success_from_appointment(ap) -> str:
+    """Формирует HTML-безопасный текст успешной записи из Appointment."""
+    date_text = "—"
+    time_text = "—"
+    s = ap.start_datetime_utc or ""
+    if len(s) >= 13 and "T" in s:
+        d, t = s.split("T", 1)
+        if len(d) == 8 and d.isdigit():
+            date_text = f"{d[6:8]}.{d[4:6]}.{d[0:4]}"
+        if len(t) >= 4 and t[:4].isdigit():
+            time_text = f"{t[:2]}:{t[2:4]}"
+    return (
+        "Вы записаны ✨\n\n"
+        "Ждём вас:\n"
+        f"📅 {date_text}\n"
+        f"🕒 {time_text}\n"
+        f"💇 {escape(str(ap.service_id or '—'))}"
     )
 
 
@@ -418,19 +604,87 @@ async def _handle_action_confirm(
     user_id: int,
     draft_id: str,
 ) -> None:
-    booking_uc.confirm_booking(
-        draft_id=draft_id,
-        user_id=user_id,
-    )
-    await state.set_state(BookingStates.confirm_done)
-    await _safe_edit_text(callback, "✅ Запись подтверждена!", reply_markup=None)
-    if callback.message is not None:
-        from app.presentation.keyboards.main_menu_kb import post_confirm_reply_keyboard
+    draft = booking_uc.draft_repo.get_by_id(draft_id)
+    if draft is None or draft.user_id != user_id:
+        if callback.message is not None:
+            await callback.message.answer("Сессия устарела. Напишите /start")
+        await _force_remove_contact_keyboard(callback.message)
+        await state.clear()
+        return
 
-        await callback.message.answer(
-            "Выберите действие:",
-            reply_markup=post_confirm_reply_keyboard(),
-        )
+    def _confirmed_for_draft() -> object | None:
+        ap = booking_uc.appointment_repo.get_by_draft_id(draft_id)
+        if (
+            ap is not None
+            and ap.status == AppointmentStatus.CONFIRMED
+            and int(ap.user_id) == int(user_id)
+        ):
+            return ap
+        return None
+
+    try:
+        ap_ready = _confirmed_for_draft()
+        if ap_ready is not None:
+            try:
+                await _apply_confirm_success_ui(callback, state, ap_ready)
+            except Exception:
+                ap2 = _confirmed_for_draft()
+                if ap2 is not None:
+                    await _apply_confirm_success_ui(callback, state, ap2)
+                else:
+                    raise
+            return
+
+        try:
+            appointment = booking_uc.confirm_booking(draft_id=draft_id, user_id=user_id)
+        except ConflictError:
+            ap_recover = _confirmed_for_draft()
+            if ap_recover is not None:
+                try:
+                    await _apply_confirm_success_ui(callback, state, ap_recover)
+                except Exception:
+                    ap2 = _confirmed_for_draft()
+                    if ap2 is not None:
+                        await _apply_confirm_success_ui(callback, state, ap2)
+                    else:
+                        raise
+                return
+            await _confirm_failure_cleanup(callback, state)
+            raise
+        except AppError:
+            ap_recover = _confirmed_for_draft()
+            if ap_recover is not None:
+                try:
+                    await _apply_confirm_success_ui(callback, state, ap_recover)
+                except Exception:
+                    ap2 = _confirmed_for_draft()
+                    if ap2 is not None:
+                        await _apply_confirm_success_ui(callback, state, ap2)
+                    else:
+                        raise
+                return
+            await _confirm_failure_cleanup(callback, state)
+            raise
+
+        try:
+            await _apply_confirm_success_ui(callback, state, appointment)
+        except Exception:
+            ap_recover = _confirmed_for_draft()
+            if ap_recover is not None:
+                await _apply_confirm_success_ui(callback, state, ap_recover)
+                return
+            await _confirm_failure_cleanup(callback, state)
+            raise
+    except Exception:
+        # Последний рубеж: не-AppError из confirm_booking или неожиданный сбой в ветках выше.
+        # Восстановление «успех» только если в БД уже есть CONFIRMED по draft_id (доказанный domain success).
+        # Ошибки показа успеха не проглатываем — пробрасываем в callback_router.
+        ap_fallback = _confirmed_for_draft()
+        if ap_fallback is not None:
+            await _apply_confirm_success_ui(callback, state, ap_fallback)
+            return
+        await _confirm_failure_cleanup(callback, state)
+        raise
 
 
 async def _handle_action_cancel(
@@ -444,6 +698,7 @@ async def _handle_action_cancel(
         draft_id=draft_id,
         user_id=user_id,
     )
+    await _clear_stale_contact_prompt_message(state, callback)
     await state.clear()
     if callback.message is not None:
         await callback.message.answer("Запись отменена.", reply_markup=ReplyKeyboardRemove())
@@ -466,6 +721,8 @@ async def _handle_action_back(
     if back_result.kind == "stale":
         if callback.message is not None:
             await callback.message.answer("Сессия устарела. Напишите /start")
+        await _clear_stale_contact_prompt_message(state, callback)
+        await _force_remove_contact_keyboard(callback.message)
         await state.clear()
         return
 
@@ -474,7 +731,9 @@ async def _handle_action_back(
         return
 
     if back_result.kind == "choose_service":
+        await _clear_stale_contact_prompt_message(state, callback)
         await state.set_state(BookingStates.choose_service)
+        await _force_remove_contact_keyboard(callback)
         await _safe_edit_text(
             callback,
             "Выберите услугу:",
@@ -483,28 +742,27 @@ async def _handle_action_back(
         return
 
     if back_result.kind == "choose_date":
+        await _clear_stale_contact_prompt_message(state, callback)
         await state.set_state(BookingStates.choose_date)
+        await _force_remove_contact_keyboard(callback)
         dates = _available_dates(settings, admin_ops_uc)
         draft_for_dates = booking_uc.draft_repo.get_by_id(draft_id)
         draft_service_id = draft_for_dates.service_id if draft_for_dates is not None else None
-        closed_dates = {
-            d
-            for d in dates
-            if _is_day_fully_busy(
-                booking_uc=booking_uc,
-                admin_ops_uc=admin_ops_uc,
-                settings=settings,
-                ymd=d,
-                service_id=draft_service_id,
-            )
-        }
+        holiday_dates, busy_dates = _calendar_holiday_and_fully_busy_sets(
+            booking_uc, admin_ops_uc, settings, dates, draft_service_id
+        )
         if not dates:
             await _safe_edit_text(callback, "Нет доступных дат для записи. Обратитесь к администратору.")
             return
         await _safe_edit_text(
             callback,
-            "Выберите дату:",
-            reply_markup=date_keyboard(draft_id, dates, closed_dates=closed_dates),
+            f"Когда вам удобно? 📅\n{_CLIENT_CALENDAR_LEGEND}",
+            reply_markup=date_keyboard(
+                draft_id,
+                dates,
+                closed_dates=holiday_dates,
+                fully_busy_dates=busy_dates,
+            ),
         )
         return
 
@@ -512,12 +770,17 @@ async def _handle_action_back(
         await state.set_state(BookingStates.enter_contact)
         # ReplyKeyboardMarkup -> только answer/send, не edit_text.
         if callback.message is not None:
-            await callback.message.answer(
-                "Отправьте имя и телефон заново:",
-                reply_markup=contact_keyboard(),
+            await _clear_stale_contact_prompt_message(state, callback)
+            await _force_remove_contact_keyboard(callback)
+            await _send_contact_prompt(
+                state=state,
+                message=callback.message,
+                text="Отправьте имя и телефон заново:",
             )
         return
 
+    await _clear_stale_contact_prompt_message(state, callback)
+    await _force_remove_contact_keyboard(callback)
     await _safe_edit_text(callback, "Назад здесь недоступно.", reply_markup=None)
 
 
@@ -529,6 +792,15 @@ async def callback_router(
     admin_ops_uc: AdminOpsUseCases,
     settings: Settings,
 ) -> None:
+    if await is_active_admin_fsm(state):
+        try:
+            await callback.answer(
+                "Сначала завершите ввод в админке или откройте /admin.",
+                show_alert=True,
+            )
+        except Exception:
+            pass
+        return
     await _safe_callback_answer(callback)
 
     if callback.data is None or callback.message is None:
@@ -608,10 +880,14 @@ async def callback_router(
             await _safe_edit_text(callback, "Неизвестное действие.", reply_markup=None)
 
     except ValueError:
+        await _clear_stale_contact_prompt_message(state, callback)
+        await _force_remove_contact_keyboard(callback)
         await _safe_edit_text(callback, "Некорректная команда. Напишите /start", reply_markup=None)
     except AppError as e:
+        await _clear_stale_contact_prompt_message(state, callback)
+        await _force_remove_contact_keyboard(callback)
         text = error_to_user_message(e)
-        if text == "Это время уже занято, выберите другое.":
+        if text == BOOKING_SLOT_CONFLICT_MESSAGE:
             b = InlineKeyboardBuilder()
             b.button(text="🕒 Выбрать другое время", callback_data=build_callback("bk", draft_id))
             b.button(text="🏠 В меню", callback_data="c1|menu")
@@ -620,6 +896,8 @@ async def callback_router(
             return
         await _safe_edit_text(callback, text, reply_markup=None)
     except Exception:
+        await _clear_stale_contact_prompt_message(state, callback)
+        await _force_remove_contact_keyboard(callback)
         await _safe_edit_text(callback, "Произошла ошибка. Попробуйте ещё раз.", reply_markup=None)
 
 
@@ -637,6 +915,15 @@ async def contact_handler(
 
     if draft is None:
         await message.answer("Сессия не найдена. Напишите /start")
+        await _clear_stale_contact_prompt_message(state, message)
+        await _force_remove_contact_keyboard(message)
+        await state.clear()
+        return
+
+    if draft.step != DraftStep.ENTER_CONTACT:
+        await message.answer("Сессия устарела. Напишите /start")
+        await _clear_stale_contact_prompt_message(state, message)
+        await _force_remove_contact_keyboard(message)
         await state.clear()
         return
 
@@ -677,16 +964,35 @@ async def contact_handler(
                 f"{draft.appointment_date[0:4]}"
             )
 
+        await _clear_stale_contact_prompt_message(state, message)
+        await _force_remove_contact_keyboard(message)
         await message.answer(
-            "Проверьте данные:\n\n"
-            f"Услуга: {draft.service_id}\n"
-            f"Дата/время: {date_text} {time_text}\n"
-            f"Имя: {draft.customer_name}\n"
-            f"Телефон: {draft.phone_e164}",
+            "Проверьте запись ✨\n\n"
+            f"💇 {escape(draft.service_id or '—')}\n"
+            f"📅 {date_text}\n"
+            f"🕒 {time_text}\n\n"
+            f"👤 {escape(draft.customer_name or '—')}\n"
+            f"📞 {escape(draft.phone_e164 or '—')}",
             reply_markup=confirm_keyboard(draft.draft_id),
         )
 
     except AppError as e:
+        await _clear_stale_contact_prompt_message(state, message)
+        await _force_remove_contact_keyboard(message)
         await message.answer(error_to_user_message(e))
     except Exception:
+        await _clear_stale_contact_prompt_message(state, message)
+        await _force_remove_contact_keyboard(message)
         await message.answer("Произошла ошибка. Попробуйте ещё раз.")
+
+
+@router.message(F.contact, ~StateFilter(BookingStates.enter_contact))
+async def contact_shared_outside_enter_contact(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    """Контакт вне шага enter_contact — не вызываем enter_contact/confirm, только снимаем клавиатуру."""
+    await _clear_stale_contact_prompt_message(state, message)
+    await _force_remove_contact_keyboard(message)
+    await message.answer("Сессия устарела. Напишите /start")
+    await state.clear()

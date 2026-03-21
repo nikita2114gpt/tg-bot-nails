@@ -23,12 +23,21 @@ def _now_iso() -> str:
 def _parse_hhmm(value: str) -> str:
     raw = (value or "").strip().replace(":", "")
     if len(raw) != 4 or not raw.isdigit():
-        raise UserInputError("Ожидается время в формате HH:MM.")
+        raise UserInputError("Ожидается время в формате HH:MM (минуты только :00 или :30).")
     hh = int(raw[:2])
     mm = int(raw[2:])
     if hh < 0 or hh > 23 or mm < 0 or mm > 59:
         raise UserInputError("Некорректное время.")
+    if mm % 30 != 0:
+        raise UserInputError("Минуты времени должны быть :00 или :30 (кратно 30 мин).")
     return f"{hh:02d}{mm:02d}"
+
+
+def _assert_slot_minutes_step30(n: int) -> None:
+    if n <= 0 or n > 240:
+        raise UserInputError("Шаг слотов должен быть от 1 до 240 минут и кратен 30 минутам.")
+    if n % 30 != 0:
+        raise UserInputError("Шаг слотов должен быть кратен 30 минутам.")
 
 
 def _hhmm_to_minutes(hhmm: str) -> int:
@@ -127,8 +136,8 @@ class AdminOpsUseCases:
             if slot_minutes is not None
             else (current.slot_minutes or self.get_schedule().slot_minutes)
         )
-        if new_step <= 0 or new_step > 240:
-            raise UserInputError("Некорректный шаг слотов.")
+        if slot_minutes is not None:
+            _assert_slot_minutes_step30(new_step)
         if _hhmm_to_minutes(new_close) <= _hhmm_to_minutes(new_open):
             raise ConflictError("Конец дня должен быть позже начала дня.")
 
@@ -154,10 +163,8 @@ class AdminOpsUseCases:
         open_hhmm = _parse_hhmm(open_time_hhmm) if open_time_hhmm is not None else current.open_time_hhmm
         close_hhmm = _parse_hhmm(close_time_hhmm) if close_time_hhmm is not None else current.close_time_hhmm
         new_step = int(slot_minutes) if slot_minutes is not None else current.slot_minutes
-        if new_step <= 0:
-            raise UserInputError("Шаг слотов должен быть положительным.")
-        if new_step > 240:
-            raise UserInputError("Шаг слотов слишком большой.")
+        if slot_minutes is not None:
+            _assert_slot_minutes_step30(new_step)
         if _hhmm_to_minutes(close_hhmm) <= _hhmm_to_minutes(open_hhmm):
             raise ConflictError("Конец дня должен быть позже начала дня.")
         updated = ScheduleSettings(
@@ -167,6 +174,49 @@ class AdminOpsUseCases:
             updated_at=_now_iso(),
         )
         self.schedule_repo.save(updated)
+        if open_time_hhmm is not None:
+            self._clear_day_override_open_times()
+        if close_time_hhmm is not None:
+            self._clear_day_override_close_times()
+        return updated
+
+    def _clear_day_override_open_times(self) -> None:
+        if self.day_schedule_repo is None:
+            return
+        list_fn = getattr(self.day_schedule_repo, "list_all", None)
+        if not callable(list_fn):
+            return
+        for row in list_fn():
+            if row.open_time_hhmm is None:
+                continue
+            cleared = replace(row, open_time_hhmm=None, updated_at=_now_iso())
+            self.day_schedule_repo.save(cleared)
+
+    def _clear_day_override_close_times(self) -> None:
+        if self.day_schedule_repo is None:
+            return
+        list_fn = getattr(self.day_schedule_repo, "list_all", None)
+        if not callable(list_fn):
+            return
+        for row in list_fn():
+            if row.close_time_hhmm is None:
+                continue
+            cleared = replace(row, close_time_hhmm=None, updated_at=_now_iso())
+            self.day_schedule_repo.save(cleared)
+
+    def update_schedule_slot_unify_day_overrides(self, slot_minutes: int) -> ScheduleSettings:
+        """Сохраняет глобальный шаг слотов и сбрасывает индивидуальные slot_minutes у day override."""
+        updated = self.update_schedule(slot_minutes=slot_minutes)
+        if self.day_schedule_repo is None:
+            return updated
+        list_fn = getattr(self.day_schedule_repo, "list_all", None)
+        if not callable(list_fn):
+            return updated
+        for row in list_fn():
+            if row.slot_minutes is None:
+                continue
+            cleared = replace(row, slot_minutes=None, updated_at=_now_iso())
+            self.day_schedule_repo.save(cleared)
         return updated
 
     def list_services(self) -> list[ServiceCatalogItem]:

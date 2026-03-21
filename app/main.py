@@ -45,6 +45,11 @@ from app.presentation.handlers.reminder_handlers import router as reminder_route
 async def main():
     print("init: load settings", flush=True)
     settings = load_settings()
+    if settings.allow_multiple_active_bookings:
+        print(
+            "init: test mode — ALLOW_MULTIPLE_ACTIVE_BOOKINGS: несколько активных записей на пользователя",
+            flush=True,
+        )
 
     print("init: create bot", flush=True)
     bot = Bot(
@@ -124,6 +129,7 @@ async def main():
         service_catalog_repo=service_catalog_repo,
         blacklist_repo=blacklist_repo,
         lifecycle_repo=lifecycle_repo,
+        allow_multiple_active_bookings=settings.allow_multiple_active_bookings,
     )
 
     appointment_uc = AppointmentUseCases(
