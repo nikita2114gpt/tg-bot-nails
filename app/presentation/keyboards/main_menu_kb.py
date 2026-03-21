@@ -5,6 +5,7 @@ BTN_MY_APPT = "📋 Моя запись"
 BTN_SERVICES_INFO = "💳 Услуги и цены"
 BTN_ADDRESS = "📍 Адрес / Контакты"
 BTN_MAIN_MENU = "🏠 В меню"
+BTN_MENU = "Меню"
 
 
 def main_menu_reply_keyboard() -> ReplyKeyboardMarkup:
