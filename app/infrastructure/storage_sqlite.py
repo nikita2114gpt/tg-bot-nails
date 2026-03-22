@@ -256,6 +256,12 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         )
     except sqlite3.OperationalError:
         pass
+    try:
+        conn.execute(
+            "ALTER TABLE client_lifecycle_markers ADD COLUMN last_phone_e164 TEXT;"
+        )
+    except sqlite3.OperationalError:
+        pass
 
 
 def _draft_from_row(row: sqlite3.Row) -> Optional[BookingDraft]:
@@ -467,12 +473,18 @@ def _lifecycle_marker_from_row(row: sqlite3.Row) -> Optional[ClientLifecycleMark
         else None
     )
     updated_at = row["updated_at"] if isinstance(row["updated_at"], str) else _now_iso()
+    try:
+        lph = row["last_phone_e164"]
+    except (KeyError, IndexError):
+        lph = None
+    last_phone_e164 = lph if isinstance(lph, str) and lph.strip() else None
     return ClientLifecycleMarker(
         user_id=user_id,
         last_confirmed_at=last_confirmed_at,
         last_confirmed_appointment_id=last_confirmed_appointment_id,
         last_no_confirm_alert_appointment_id=last_no_confirm_alert_appointment_id,
         last_reactivation_sent_at=last_reactivation_sent_at,
+        last_phone_e164=last_phone_e164,
         updated_at=updated_at,
     )
 
@@ -550,6 +562,24 @@ class DraftRepository:
                 (user_id,),
             ).fetchone()
             return _draft_from_row(row)
+
+    def cancel_other_drafts_for_user(self, user_id: int, keep_draft_id: str) -> None:
+        """Помечает остальные черновики пользователя как отменённые (новый сценарий записи)."""
+        now = _now_iso()
+        with _connect(self._db_path) as conn:
+            conn.execute(
+                """
+                UPDATE drafts SET step=?, updated_at=?
+                WHERE user_id=? AND draft_id!=? AND step!=?
+                """,
+                (
+                    DraftStep.CANCELLED.value,
+                    now,
+                    user_id,
+                    keep_draft_id,
+                    DraftStep.CANCELLED.value,
+                ),
+            )
 
 
 class AppointmentRepository:
@@ -1272,14 +1302,16 @@ class ClientLifecycleMarkerRepository:
                     last_confirmed_appointment_id,
                     last_no_confirm_alert_appointment_id,
                     last_reactivation_sent_at,
+                    last_phone_e164,
                     updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(user_id) DO UPDATE SET
                     last_confirmed_at=excluded.last_confirmed_at,
                     last_confirmed_appointment_id=excluded.last_confirmed_appointment_id,
                     last_no_confirm_alert_appointment_id=excluded.last_no_confirm_alert_appointment_id,
                     last_reactivation_sent_at=excluded.last_reactivation_sent_at,
+                    last_phone_e164=excluded.last_phone_e164,
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -1288,6 +1320,7 @@ class ClientLifecycleMarkerRepository:
                     marker.last_confirmed_appointment_id,
                     marker.last_no_confirm_alert_appointment_id,
                     marker.last_reactivation_sent_at,
+                    marker.last_phone_e164,
                     marker.updated_at,
                 ),
             )

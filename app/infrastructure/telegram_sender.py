@@ -59,7 +59,7 @@ class TelegramSender:
         except Exception:
             user_id = None
 
-        if user_id is None:
+        if user_id is None or user_id == 0:
             return
 
         if reminder_kind == "reactivation":
@@ -90,19 +90,17 @@ class TelegramSender:
                 f"Дата/время: {_fmt_slot(start_datetime_utc)}\n\n"
                 "Подтвердите, пожалуйста, что запись актуальна."
             )
-            kb = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [InlineKeyboardButton(text="✅ Подтверждаю", callback_data=build_reminder_confirm(appointment_id))],
-                    [InlineKeyboardButton(text="❌ Отменить запись", callback_data=build_reminder_cancel(appointment_id))],
-                    [InlineKeyboardButton(text="📞 Позвонить", url=f"tel:{phone_e164}")],
-                ]
+        else:
+            text = (
+                "⏰ Напоминание о записи\n\n"
+                f"Услуга: {service_id}\n"
+                f"Дата/время: {_fmt_slot(start_datetime_utc)}"
             )
-            await self.bot.send_message(user_id, text, reply_markup=kb)
-            return
-
-        text = (
-            "⏰ Напоминание о записи\n\n"
-            f"Услуга: {service_id}\n"
-            f"Дата/время: {_fmt_slot(start_datetime_utc)}"
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Подтверждаю", callback_data=build_reminder_confirm(appointment_id))],
+                [InlineKeyboardButton(text="❌ Отменить запись", callback_data=build_reminder_cancel(appointment_id))],
+                [InlineKeyboardButton(text="📞 Позвонить", url=f"tel:{phone_e164}")],
+            ]
         )
-        await self.bot.send_message(user_id, text)
+        await self.bot.send_message(user_id, text, reply_markup=kb)

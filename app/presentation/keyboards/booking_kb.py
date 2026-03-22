@@ -2,6 +2,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeybo
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from app.presentation.callback.booking_callbacks import build_callback
+from app.presentation.callback.nav_callbacks import build_admin_move_date, build_admin_open
 
 
 def service_keyboard(draft_id: str, services: list[str]) -> InlineKeyboardMarkup:
@@ -80,6 +81,63 @@ def date_keyboard(
     if rem:
         adjust_pattern.append(rem)
     adjust_pattern.extend([1, 1])
+    builder.adjust(*adjust_pattern)
+    return builder.as_markup()
+
+
+def admin_move_date_keyboard(
+    ap_id: str,
+    dates: list[str],
+    closed_dates: set[str] | None = None,
+    fully_busy_dates: set[str] | None = None,
+) -> InlineKeyboardMarkup:
+    """Сетка дат как у клиента; callback — перенос записи (a1|mvd|…)."""
+    NOOP = "a1|noop"
+    builder = InlineKeyboardBuilder()
+    closed_dates = closed_dates or set()
+    fully_busy_dates = fully_busy_dates or set()
+    norm_dates = [d for d in dates if len(d) == 8 and d.isdigit()]
+    if not norm_dates:
+        norm_dates = dates
+    month_label = ""
+    if norm_dates and len(norm_dates[0]) == 8 and norm_dates[0].isdigit():
+        month_label = f"{norm_dates[0][6:8]}.{norm_dates[0][4:6]} - {norm_dates[-1][6:8]}.{norm_dates[-1][4:6]}"
+    else:
+        month_label = "Календарь"
+    builder.button(text=month_label, callback_data=NOOP)
+    for wd in ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"):
+        builder.button(text=wd, callback_data=NOOP)
+    leading_pad = 0
+    if norm_dates and len(norm_dates[0]) == 8 and norm_dates[0].isdigit():
+        import datetime as _dt
+
+        leading_pad = _dt.datetime.strptime(norm_dates[0], "%Y%m%d").weekday()
+    for i in range(leading_pad):
+        builder.button(text="·", callback_data=NOOP)
+    for date_value in norm_dates:
+        label = date_value[6:8] if len(date_value) == 8 and date_value.isdigit() else date_value
+        if date_value in closed_dates:
+            label = f"🚫{label}"
+            cb = NOOP
+        elif date_value in fully_busy_dates:
+            label = f"🔒{label}"
+            cb = NOOP
+        else:
+            cb = build_admin_move_date(ap_id, date_value)
+        builder.button(text=label, callback_data=cb)
+
+    builder.button(text="« К записи", callback_data=build_admin_open(ap_id))
+
+    grid_cells = len(norm_dates) + leading_pad
+    rows = grid_cells // 7
+    rem = grid_cells % 7
+    adjust_pattern: list[int] = []
+    adjust_pattern.extend([1, 7])
+    if rows > 0:
+        adjust_pattern.extend([7] * rows)
+    if rem:
+        adjust_pattern.append(rem)
+    adjust_pattern.append(1)
     builder.adjust(*adjust_pattern)
     return builder.as_markup()
 

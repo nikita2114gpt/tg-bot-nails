@@ -382,6 +382,7 @@ def _marker_to_dict(marker: ClientLifecycleMarker) -> dict:
         "last_confirmed_appointment_id": marker.last_confirmed_appointment_id,
         "last_no_confirm_alert_appointment_id": marker.last_no_confirm_alert_appointment_id,
         "last_reactivation_sent_at": marker.last_reactivation_sent_at,
+        "last_phone_e164": marker.last_phone_e164,
         "updated_at": marker.updated_at,
     }
 
@@ -397,12 +398,14 @@ def _marker_from_dict(data: dict) -> Optional[ClientLifecycleMarker]:
     lca_id = data.get("last_confirmed_appointment_id")
     lnc_id = data.get("last_no_confirm_alert_appointment_id")
     lra = data.get("last_reactivation_sent_at")
+    lph = data.get("last_phone_e164")
     return ClientLifecycleMarker(
         user_id=user_id,
         last_confirmed_at=lca if isinstance(lca, str) else None,
         last_confirmed_appointment_id=lca_id if isinstance(lca_id, str) else None,
         last_no_confirm_alert_appointment_id=lnc_id if isinstance(lnc_id, str) else None,
         last_reactivation_sent_at=lra if isinstance(lra, str) else None,
+        last_phone_e164=lph if isinstance(lph, str) and lph.strip() else None,
         updated_at=data.get("updated_at") if isinstance(data.get("updated_at"), str) else _now_iso(),
     )
 
@@ -499,6 +502,32 @@ class DraftRepository:
                 return _draft_from_dict(d)
 
         return None
+
+    def cancel_other_drafts_for_user(self, user_id: int, keep_draft_id: str) -> None:
+        """Помечает остальные черновики пользователя как отменённые (новый сценарий записи)."""
+        data = _load_data()
+        drafts = _ensure_list(data.get("drafts"))
+        now = _now_iso()
+        changed = False
+        for d in drafts:
+            if not isinstance(d, dict):
+                continue
+            try:
+                uid = int(d.get("user_id"))
+            except Exception:
+                continue
+            if uid != int(user_id):
+                continue
+            if d.get("draft_id") == keep_draft_id:
+                continue
+            if d.get("step") == DraftStep.CANCELLED.value:
+                continue
+            d["step"] = DraftStep.CANCELLED.value
+            d["updated_at"] = now
+            changed = True
+        if changed:
+            data["drafts"] = drafts
+            _save_data(data)
 
 
 class AppointmentRepository:

@@ -3,18 +3,24 @@ from __future__ import annotations
 from aiogram import F, Router
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
+from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from app.application.admin_ops_uc import AdminOpsUseCases
 from app.application.appointment_uc import AppointmentUseCases, format_slot_utc_for_user
-from app.application.booking_uc import ACTIVE_BOOKING_CONFLICT_MESSAGE, BookingUseCases
+from app.application.booking_uc import BookingUseCases
 from app.config import Settings
 from app.core.errors import AppError, ConflictError, error_to_user_message
 from app.domain.enums import AppointmentStatus
 from app.presentation.callback.nav_callbacks import build_client_cancel_my, parse_client
 from app.presentation.fsm.admin_guard import is_active_admin_fsm
 from app.presentation.fsm.states import AdminStates, BookingStates
+from app.presentation.client_perf import PerfSpan
+from app.presentation.handlers.booking_handlers import (
+    BOOKING_UI_MSG_ID_KEY,
+    invalidate_previous_booking_ui,
+    remember_booking_ui_message,
+)
 from app.presentation.keyboards.booking_kb import service_keyboard
 from app.presentation.keyboards.main_menu_kb import (
     BTN_ADDRESS,
@@ -34,10 +40,7 @@ def _start_booking_conflict_user_text(exc: ConflictError) -> str:
     start_booking() может кинуть ConflictError из blacklist или из проверки активной записи.
     Нельзя подменять текст исключения на «активная запись» — иначе blacklist выглядит как дубликат записи.
     """
-    msg = str(exc)
-    if msg == ACTIVE_BOOKING_CONFLICT_MESSAGE:
-        return f"{msg}\n\nНажмите «Моя запись», чтобы увидеть текущую запись."
-    return msg
+    return str(exc)
 
 
 def _fmt_duration_minutes(value: int) -> str:
@@ -61,7 +64,7 @@ def _service_card_lines(
         active_items = []
 
     if active_items:
-        lines = ["<b>Услуги и цены</b>\n"]
+        lines = ["<b>Прайс ✨</b>\n"]
         for item in active_items:
             lines.append(
                 f"• {item.name}\n"
@@ -70,7 +73,7 @@ def _service_card_lines(
             )
         return "\n".join(lines).strip()
 
-    lines = ["<b>Услуги и цены</b>\n"]
+    lines = ["<b>Прайс ✨</b>\n"]
     for svc in booking_uc.list_available_services():
         price = settings.service_price_text.get(svc, "—")
         dur = settings.service_duration_text.get(svc, "—")
@@ -80,7 +83,7 @@ def _service_card_lines(
 
 def _contacts_text(settings: Settings, admin_ops_uc: AdminOpsUseCases) -> str:
     info = admin_ops_uc.get_salon_info(settings.salon_address, settings.salon_contacts)
-    lines = ["<b>Адрес и контакты</b>\n"]
+    lines = ["<b>Контактная информация 📍</b>\n"]
     if info.show_address:
         lines.append(f"📍 Адрес:\n{info.address_text or settings.salon_address}\n")
     if info.show_contacts:
@@ -102,12 +105,20 @@ def _my_appt_text(settings: Settings, ap, admin_ops_uc: AdminOpsUseCases) -> str
     except Exception:
         pass
     when = format_slot_utc_for_user(ap.start_datetime_utc)
+    admin_line = ""
+    try:
+        if int(ap.user_id) == 0:
+            admin_line = "\n\n🛠 Создано админом"
+    except (TypeError, ValueError):
+        pass
     return (
-        "<b>Ваша запись</b>\n\n"
+        "<b>Ваша активная запись 📌</b>\n"
+        "Ниже указаны все актуальные данные.\n\n"
         f"📅 Дата и время: {when}\n"
         f"💇 Услуга: {ap.service_id}\n"
         f"💰 Цена: {price}\n"
         f"⏱ Длительность: {dur}"
+        f"{admin_line}"
     )
 
 
@@ -117,12 +128,9 @@ async def cmd_start(
     state: FSMContext,
 ) -> None:
     await state.clear()
-    try:
-        await message.answer("\u200b", reply_markup=ReplyKeyboardRemove())
-    except Exception:
-        pass
+    await message.answer("Здравствуйте! 🌸\nДобро пожаловать в бот записи.")
     await message.answer(
-        "Главное меню. Выберите действие:",
+        "Выберите, что хотите сделать.",
         reply_markup=main_menu_reply_keyboard(),
     )
 
@@ -130,15 +138,16 @@ async def cmd_start(
 @router.message(F.text == BTN_MAIN_MENU, ~StateFilter(AdminStates))
 @router.message(F.text == BTN_MENU, ~StateFilter(AdminStates))
 async def go_main_menu(message: Message, state: FSMContext) -> None:
+    perf = PerfSpan("client_go_main_menu")
+    perf.mark("handler_entry")
     await state.clear()
-    try:
-        await message.answer("\u200b", reply_markup=ReplyKeyboardRemove())
-    except Exception:
-        pass
+    perf.mark("after_fsm_clear")
+    perf.mark("after_reply_keyboard_remove")
     await message.answer(
-        "Главное меню.",
+        "Вы вернулись в клиентское меню.",
         reply_markup=main_menu_reply_keyboard(),
     )
+    perf.mark("done")
 
 
 @router.message(F.text == BTN_BOOK, ~StateFilter(AdminStates))
@@ -147,15 +156,23 @@ async def start_booking_from_menu(
     state: FSMContext,
     booking_uc: BookingUseCases,
 ) -> None:
+    perf = PerfSpan('client_btn_book')
+    perf.mark("handler_entry")
     if message.from_user is None:
         await message.answer("Некорректный запрос.")
         return
 
+    prev_data = await state.get_data()
+    perf.mark("after_fsm_get_data")
+    old_ui = prev_data.get(BOOKING_UI_MSG_ID_KEY)
     await state.clear()
+    perf.mark("after_fsm_clear")
     try:
-        await message.answer("\u200b", reply_markup=ReplyKeyboardRemove())
+        await invalidate_previous_booking_ui(message.bot, message.chat.id, old_ui)
     except Exception:
         pass
+    perf.mark("after_invalidate_previous_ui")
+    perf.mark("after_reply_keyboard_remove")
     try:
         draft = booking_uc.start_booking(user_id=message.from_user.id)
     except ConflictError as e:
@@ -163,12 +180,18 @@ async def start_booking_from_menu(
             _start_booking_conflict_user_text(e),
             reply_markup=main_menu_reply_keyboard(),
         )
+        perf.mark("done_conflict")
         return
+    perf.mark("after_start_booking_uc_incl_cancel_others")
     await state.set_state(BookingStates.choose_service)
-    await message.answer(
-        "Выберите услугу:",
+    perf.mark("after_set_state_choose_service")
+    sent = await message.answer(
+        "Шаг 1/5 — выберите услугу",
         reply_markup=service_keyboard(draft.draft_id, booking_uc.list_available_services()),
     )
+    perf.mark("after_answer_service_keyboard")
+    await remember_booking_ui_message(state, sent)
+    perf.mark("done")
 
 
 @router.message(F.text == BTN_MY_APPT, ~StateFilter(AdminStates))
@@ -179,19 +202,19 @@ async def my_appointment(
     admin_ops_uc: AdminOpsUseCases,
     settings: Settings,
 ) -> None:
+    perf = PerfSpan("client_my_appt")
+    perf.mark("handler_entry")
     if message.from_user is None:
         return
     ap = appointment_uc.get_my_active_appointment(message.from_user.id)
+    perf.mark("after_get_active_appointment")
     if ap is None or ap.status != AppointmentStatus.CONFIRMED:
-        builder = InlineKeyboardBuilder()
-        builder.button(text="📅 Записаться", callback_data="c1|book")
-        builder.button(text="🏠 В меню", callback_data="c1|menu")
-        builder.adjust(1)
         await message.answer(
-            "У вас нет активной записи.\n"
-            "Вы можете записаться на услугу или вернуться в меню.",
-            reply_markup=builder.as_markup(),
+            "Пока у вас нет действующей записи.\n"
+            "Когда будете готовы, нажмите «Записаться».",
+            reply_markup=main_menu_reply_keyboard(),
         )
+        perf.mark("done_no_active")
         return
 
     builder = InlineKeyboardBuilder()
@@ -201,10 +224,13 @@ async def my_appointment(
     )
     builder.button(text="🏠 В меню", callback_data="c1|menu")
     builder.adjust(1)
+    body = _my_appt_text(settings, ap, admin_ops_uc)
+    perf.mark("after_build_my_appt_text")
     await message.answer(
-        _my_appt_text(settings, ap, admin_ops_uc),
+        body,
         reply_markup=builder.as_markup(),
     )
+    perf.mark("done_with_active")
 
 
 @router.message(F.text == BTN_SERVICES_INFO, ~StateFilter(AdminStates))
@@ -214,12 +240,17 @@ async def services_info(
     booking_uc: BookingUseCases,
     admin_ops_uc: AdminOpsUseCases,
 ) -> None:
-    await message.answer(_service_card_lines(settings, booking_uc, admin_ops_uc))
+    perf = PerfSpan("client_services_info")
+    perf.mark("handler_entry")
+    text = _service_card_lines(settings, booking_uc, admin_ops_uc)
+    perf.mark("after_build_service_card")
+    await message.answer(text, reply_markup=main_menu_reply_keyboard())
+    perf.mark("done")
 
 
 @router.message(F.text == BTN_ADDRESS, ~StateFilter(AdminStates))
 async def address_info(message: Message, settings: Settings, admin_ops_uc: AdminOpsUseCases) -> None:
-    await message.answer(_contacts_text(settings, admin_ops_uc))
+    await message.answer(_contacts_text(settings, admin_ops_uc), reply_markup=main_menu_reply_keyboard())
 
 
 async def _safe_cq_answer(callback: CallbackQuery) -> None:
@@ -252,29 +283,36 @@ async def client_inline_nav(
     try:
         action, parts = parse_client(callback.data)
     except ValueError:
-        await callback.message.answer("Действие устарело. Откройте раздел заново.")
+        await callback.message.answer(
+            "Действие устарело. Откройте раздел заново.",
+            reply_markup=main_menu_reply_keyboard(),
+        )
         return
 
     if action == "menu":
         await state.clear()
-        try:
-            await callback.message.answer("\u200b", reply_markup=ReplyKeyboardRemove())
-        except Exception:
-            pass
         await callback.message.answer(
-            "Главное меню.",
+            "Вы вернулись в клиентское меню.",
             reply_markup=main_menu_reply_keyboard(),
         )
         return
 
     if action == "book":
+        perf = PerfSpan("client_inline_book")
+        perf.mark("handler_entry")
+        prev_data = await state.get_data()
+        perf.mark("after_fsm_get_data")
+        old_ui = prev_data.get(BOOKING_UI_MSG_ID_KEY)
         await state.clear()
+        perf.mark("after_fsm_clear")
         if callback.from_user is None:
             return
         try:
-            await callback.message.answer("\u200b", reply_markup=ReplyKeyboardRemove())
+            await invalidate_previous_booking_ui(callback.message.bot, callback.message.chat.id, old_ui)
         except Exception:
             pass
+        perf.mark("after_invalidate_previous_ui")
+        perf.mark("after_reply_keyboard_remove")
         try:
             draft = booking_uc.start_booking(user_id=callback.from_user.id)
         except ConflictError as e:
@@ -282,12 +320,18 @@ async def client_inline_nav(
                 _start_booking_conflict_user_text(e),
                 reply_markup=main_menu_reply_keyboard(),
             )
+            perf.mark("done_conflict")
             return
+        perf.mark("after_start_booking_uc_incl_cancel_others")
         await state.set_state(BookingStates.choose_service)
-        await callback.message.answer(
-            "Выберите услугу:",
+        perf.mark("after_set_state_choose_service")
+        sent = await callback.message.answer(
+            "Шаг 1/5 — выберите услугу",
             reply_markup=service_keyboard(draft.draft_id, booking_uc.list_available_services()),
         )
+        perf.mark("after_answer_service_keyboard")
+        await remember_booking_ui_message(state, sent)
+        perf.mark("done")
         return
 
     if action == "x" and parts:
@@ -298,7 +342,10 @@ async def client_inline_nav(
         try:
             _, already = appointment_uc.cancel_my_appointment_by_id(uid, ap_id)
         except AppError as e:
-            await callback.message.answer(error_to_user_message(e))
+            await callback.message.answer(
+                error_to_user_message(e),
+                reply_markup=main_menu_reply_keyboard(),
+            )
             return
         await state.clear()
         msg = (
@@ -309,4 +356,7 @@ async def client_inline_nav(
         await callback.message.answer(msg, reply_markup=main_menu_reply_keyboard())
         return
 
-    await callback.message.answer("Действие устарело. Откройте «Моя запись» снова.")
+    await callback.message.answer(
+        "Действие устарело. Откройте «Моя запись» снова.",
+        reply_markup=main_menu_reply_keyboard(),
+    )

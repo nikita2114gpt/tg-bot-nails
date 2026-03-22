@@ -136,6 +136,7 @@ async def main():
         appointment_repo=appointment_repo,
         allowed_services=settings.services,
         outbox_repo=outbox_repo,
+        lifecycle_repo=lifecycle_repo,
     )
     admin_ops_uc = AdminOpsUseCases(
         schedule_repo=schedule_repo,

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import logging
+import traceback
+
 from aiogram import Router
 from aiogram.filters import Command, StateFilter
 from aiogram.types import Message
@@ -33,6 +36,18 @@ async def on_error(event: ErrorEvent, bot: object | None = None) -> None:  # bot
         err_text = str(event.exception)
     except Exception:
         err_text = "internal error"
+
+    try:
+        tb = "".join(
+            traceback.format_exception(
+                type(event.exception),
+                event.exception,
+                event.exception.__traceback__,
+            )
+        )
+    except Exception:
+        tb = f"{type(event.exception).__name__}: {err_text}"
+    _log.error("handler error:\n%s", tb.rstrip())
 
     text = "Произошла ошибка при выполнении команды. Попробуйте ещё раз."
 

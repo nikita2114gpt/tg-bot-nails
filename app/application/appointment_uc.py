@@ -39,10 +39,12 @@ class AppointmentUseCases:
         appointment_repo: object,
         allowed_services: list[str],
         outbox_repo: object | None = None,
+        lifecycle_repo: object | None = None,
     ) -> None:
         self.appointment_repo = appointment_repo
         self.allowed_services = allowed_services
         self.outbox_repo = outbox_repo
+        self.lifecycle_repo = lifecycle_repo
 
     def _emit_admin_event_once(
         self,
@@ -140,6 +142,53 @@ class AppointmentUseCases:
         result.sort(key=lambda x: x.start_datetime_utc)
         return result
 
+    def _known_phones_for_user(self, user_id: int) -> set[str]:
+        """Номера, которые однозначно связаны с этим Telegram user_id в нашей БД."""
+        phones: set[str] = set()
+        for a in self._list_by_user(user_id):
+            p = (a.phone_e164 or "").strip()
+            if p:
+                phones.add(p)
+        repo = self.lifecycle_repo
+        if repo is not None:
+            try:
+                fn = getattr(repo, "get_by_user_id", None)
+                if callable(fn):
+                    marker = fn(int(user_id))
+                    mp = getattr(marker, "last_phone_e164", None) if marker is not None else None
+                    if isinstance(mp, str) and mp.strip():
+                        phones.add(mp.strip())
+            except Exception:
+                pass
+        return phones
+
+    def _future_confirmed_by_phone(
+        self, phone_e164: str, *, exclude_draft_id: Optional[str] = None
+    ) -> Optional[Appointment]:
+        if not (phone_e164 or "").strip():
+            return None
+        norm = (phone_e164 or "").strip()
+        now_key = datetime.utcnow().strftime("%Y%m%dT%H%M")
+        try:
+            items = self.appointment_repo.list_all()
+        except Exception:
+            return None
+        candidates: list[Appointment] = []
+        for a in items:
+            if a.status != AppointmentStatus.CONFIRMED:
+                continue
+            if (a.phone_e164 or "").strip() != norm:
+                continue
+            if (a.start_datetime_utc or "") < now_key:
+                continue
+            if exclude_draft_id and (a.draft_id or "") == exclude_draft_id:
+                continue
+            candidates.append(a)
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: (x.start_datetime_utc or "", x.appointment_id or ""))
+        return candidates[0]
+
     def get_my_active_appointment(self, user_id: int) -> Optional[Appointment]:
         """
         Активная запись для self-service: как get_active_confirmed_for_user —
@@ -147,24 +196,42 @@ class AppointmentUseCases:
         """
         fn = getattr(self.appointment_repo, "get_active_confirmed_for_user", None)
         if callable(fn):
-            return fn(user_id)
-        now_key = datetime.utcnow().strftime("%Y%m%dT%H%M")
-        items = self._list_by_user(user_id)
-        future = [
-            a
-            for a in items
-            if a.status == AppointmentStatus.CONFIRMED
-            and (a.start_datetime_utc or "") >= now_key
-        ]
-        if not future:
-            return None
-        future.sort(key=lambda a: (a.start_datetime_utc or "", a.appointment_id or ""))
-        return future[0]
+            ap = fn(user_id)
+        else:
+            now_key = datetime.utcnow().strftime("%Y%m%dT%H%M")
+            items = self._list_by_user(user_id)
+            future = [
+                a
+                for a in items
+                if a.status == AppointmentStatus.CONFIRMED
+                and (a.start_datetime_utc or "") >= now_key
+            ]
+            if not future:
+                ap = None
+            else:
+                future.sort(key=lambda a: (a.start_datetime_utc or "", a.appointment_id or ""))
+                ap = future[0]
+        if ap is not None:
+            return ap
+        # Walk-in (user_id=0), созданная админом: показываем только если номер в доверенном множестве.
+        for phone in self._known_phones_for_user(user_id):
+            cand = self._future_confirmed_by_phone(phone)
+            if cand is not None and int(cand.user_id) == 0:
+                return cand
+        return None
+
+    def _client_can_manage_active(self, ap: Appointment, user_id: int) -> bool:
+        if int(ap.user_id) == int(user_id):
+            return True
+        if int(ap.user_id) != 0:
+            return False
+        p = (ap.phone_e164 or "").strip()
+        return bool(p and p in self._known_phones_for_user(user_id))
 
     def _cancel_appointment_for_user(
         self, ap: Appointment, user_id: int
     ) -> tuple[Appointment, bool]:
-        if ap.user_id != user_id:
+        if not self._client_can_manage_active(ap, user_id):
             raise NotFoundError("Запись не найдена.")
         if ap.status == AppointmentStatus.CANCELLED:
             return ap, True

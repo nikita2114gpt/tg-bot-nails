@@ -49,6 +49,8 @@ class ClientLifecycleMarker:
     last_confirmed_appointment_id: Optional[str] = None
     last_no_confirm_alert_appointment_id: Optional[str] = None
     last_reactivation_sent_at: Optional[str] = None
+    # Последний номер, который клиент вводил в боте (для «Моя запись» при walk-in с тем же номером).
+    last_phone_e164: Optional[str] = None
     updated_at: str = field(default_factory=_now_iso)
 
 

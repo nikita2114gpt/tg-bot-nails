@@ -164,7 +164,13 @@ class OutboxWorker:
                 continue
             if str(ap.status.value) != "confirmed":
                 continue
-            by_user.setdefault(int(ap.user_id), []).append(ap)
+            try:
+                ap_uid = int(ap.user_id)
+            except (TypeError, ValueError):
+                continue
+            if ap_uid == 0:
+                continue
+            by_user.setdefault(ap_uid, []).append(ap)
 
         for user_id, rows in by_user.items():
             # Safety: never reactivate users with active future booking.
