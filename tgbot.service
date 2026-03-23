@@ -12,10 +12,13 @@ WorkingDirectory=/opt/tgbot/bot
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/opt/tgbot/bot/.venv/bin/python -m app.main
 Restart=always
-RestartSec=5
+RestartSec=3
 TimeoutStartSec=60
 KillSignal=SIGINT
 TimeoutStopSec=30
+LimitNOFILE=4096
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

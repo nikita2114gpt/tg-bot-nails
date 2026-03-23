@@ -13,6 +13,9 @@ fi
 pip install -r requirements.txt
 python -m compileall app
 
+mkdir -p logs backups
+chmod +x scripts/* || true
+
 cp tgbot.service /etc/systemd/system/tgbot.service
 systemctl daemon-reload
 systemctl enable tgbot

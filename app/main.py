@@ -12,7 +12,7 @@ from app.application.appointment_uc import AppointmentUseCases
 from app.application.admin_ops_uc import AdminOpsUseCases
 from app.application.booking_uc import BookingUseCases
 from app.config import load_settings
-from app.infrastructure.logging import configure_logging, get_logger
+from app.infrastructure.logging import attach_telegram_alerts, configure_logging, get_logger
 from app.infrastructure.outbox_worker import OutboxWorker
 from app.infrastructure.storage_filejson import (
     AppointmentRepository,
@@ -48,6 +48,16 @@ from app.presentation.handlers.reminder_handlers import router as reminder_route
 logger = get_logger(__name__)
 
 
+def _resolve_storage() -> tuple[str, str]:
+    base_dir = Path(__file__).resolve().parents[1]
+    storage_backend = (os.getenv("BOT_STORAGE_BACKEND", "json") or "json").lower().strip()
+    sqlite_db_path = os.getenv(
+        "SQLITE_DB_PATH",
+        str(base_dir / "data" / "bot2.sqlite3"),
+    )
+    return storage_backend, sqlite_db_path
+
+
 def _preflight_checks() -> None:
     logger.info("startup-check: validate environment")
     raw_token = (os.getenv("BOT_TOKEN") or "").strip()
@@ -58,16 +68,11 @@ def _preflight_checks() -> None:
     if not raw_admin_ids:
         raise RuntimeError("startup-check failed: ADMIN_IDS is empty or missing")
 
-    storage_backend = (os.getenv("BOT_STORAGE_BACKEND", "json") or "json").lower().strip()
+    storage_backend, sqlite_db_path = _resolve_storage()
     if storage_backend != "sqlite":
         logger.info("startup-check: sqlite probe skipped (backend=%s)", storage_backend)
         return
 
-    base_dir = Path(__file__).resolve().parents[1]
-    sqlite_db_path = os.getenv(
-        "SQLITE_DB_PATH",
-        str(base_dir / "data" / "bot2.sqlite3"),
-    )
     db_path = Path(sqlite_db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(str(db_path), timeout=10) as conn:
@@ -75,7 +80,22 @@ def _preflight_checks() -> None:
     logger.info("startup-check: sqlite is reachable (%s)", db_path)
 
 
-async def main():
+async def _sqlite_watchdog(storage_backend: str, sqlite_db_path: str, interval_seconds: int = 60) -> None:
+    if storage_backend != "sqlite":
+        return
+
+    while True:
+        try:
+            with sqlite3.connect(sqlite_db_path, timeout=10) as conn:
+                conn.execute("SELECT 1;")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("sqlite-watchdog: database probe failed (path=%s)", sqlite_db_path)
+        await asyncio.sleep(interval_seconds)
+
+
+async def _run_once() -> None:
     logger.info("init: load settings")
     settings = load_settings()
     if not settings.admin_ids:
@@ -96,11 +116,7 @@ async def main():
 
     logger.info("init: create repositories")
     base_dir = Path(__file__).resolve().parents[1]
-    storage_backend = (os.getenv("BOT_STORAGE_BACKEND", "json") or "json").lower().strip()
-    sqlite_db_path = os.getenv(
-        "SQLITE_DB_PATH",
-        str(base_dir / "data" / "bot2.sqlite3"),
-    )
+    storage_backend, sqlite_db_path = _resolve_storage()
 
     if storage_backend == "sqlite":
         try:
@@ -190,6 +206,7 @@ async def main():
         bot=bot,
         admin_ids=settings.admin_ids,
     )
+    attach_telegram_alerts(bot=bot, admin_ids=settings.admin_ids)
 
     logger.info("init: create outbox worker")
     worker = OutboxWorker(
@@ -208,6 +225,7 @@ async def main():
     dp.include_router(admin_router)
 
     worker_task: asyncio.Task | None = None
+    watchdog_task: asyncio.Task | None = None
 
     logger.info("init: bot get_me")
     try:
@@ -224,6 +242,7 @@ async def main():
     logger.info("bot started: @%s", username if username else "unknown")
 
     worker_task = asyncio.create_task(worker.start())
+    watchdog_task = asyncio.create_task(_sqlite_watchdog(storage_backend, sqlite_db_path))
 
     try:
         logger.info("start polling")
@@ -242,14 +261,13 @@ async def main():
         except TelegramConflictError as e:
             # Типовая ситуация, когда запущено более одного экземпляра бота
             # (aiogram при getUpdates/long polling получает Conflict).
-            logger.error(
+            logger.exception(
                 f"TelegramConflictError: конфликт getUpdates. "
                 f"Убедись, что запущен только один инстанс бота. details={e}",
             )
-            return
+            raise
         except KeyboardInterrupt:
-            logger.info("shutdown: keyboard interrupt requested")
-            return
+            raise
         except Exception:
             logger.exception("polling crashed with unhandled exception")
             raise
@@ -263,6 +281,13 @@ async def main():
             except asyncio.CancelledError:
                 pass
 
+        if watchdog_task is not None and not watchdog_task.done():
+            watchdog_task.cancel()
+            try:
+                await watchdog_task
+            except asyncio.CancelledError:
+                pass
+
         logger.info("shutdown: closing bot session")
         await bot.session.close()
 
@@ -271,7 +296,7 @@ if __name__ == "__main__":
     configure_logging()
     try:
         _preflight_checks()
-        asyncio.run(main())
+        asyncio.run(_run_once())
     except KeyboardInterrupt:
         logger.info("shutdown: interrupted by user")
     except Exception:
