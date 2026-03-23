@@ -11,11 +11,13 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from app.application.admin_ops_uc import AdminOpsUseCases
 from app.application.appointment_uc import AppointmentUseCases, format_slot_utc_for_user
 from app.application.booking_uc import BookingUseCases
+from app.application.service_catalog_view import resolve_service_price_and_duration
+from app.application.service_catalog_view import format_service_block
 from app.config import Settings
 from app.core.errors import AppError, error_to_user_message
 from app.domain.enums import AppointmentStatus
 from app.domain.models import Appointment
-from app.domain.ops_models import BlacklistEntry, ScheduleSettings, ServiceCatalogItem
+from app.domain.ops_models import BlacklistEntry, PriceListItem, ScheduleSettings, ServiceCatalogItem
 from app.presentation.callback.nav_callbacks import (
     build_admin_cancel_appt,
     build_admin_edit_menu,
@@ -58,6 +60,13 @@ from app.presentation.callback.nav_callbacks import (
     build_admin_ops_service_open,
     build_admin_ops_service_toggle,
     build_admin_ops_services,
+    build_admin_ops_price_activate,
+    build_admin_ops_price_add,
+    build_admin_ops_price_deactivate,
+    build_admin_ops_price_delete,
+    build_admin_ops_price_edit,
+    build_admin_ops_price_list,
+    build_admin_ops_price_open,
     parse_admin,
 )
 from app.presentation.fsm.booking_keys import ADMIN_ASSISTED_BOOKING_KEY
@@ -220,9 +229,10 @@ def _home_keyboard() -> InlineKeyboardBuilder:
     b.button(text="🗓 Расписание", callback_data=build_admin_ops_schedule())
     b.button(text="📍 Адрес / Контакты", callback_data=build_admin_ops_salon())
     b.button(text="💎 Услуги", callback_data=build_admin_ops_services())
+    b.button(text="💸 Прайс", callback_data=build_admin_ops_price_list())
     b.button(text="⛔ Blacklist", callback_data=build_admin_ops_blacklist())
     b.button(text="➕ Добавить клиента", callback_data="a1|adm_cli")
-    b.adjust(1, 2, 2, 2, 1)
+    b.adjust(1, 2, 2, 2, 2, 1)
     return b
 
 
@@ -333,6 +343,14 @@ def _service_line(item: ServiceCatalogItem) -> str:
     return f"{mark} {item.name} · {dur} · {item.price_text}"
 
 
+def _price_line(item: PriceListItem) -> str:
+    mark = "🟢" if item.is_active else "⚪"
+    short = (item.display_text or "").replace("\n", " ")
+    if len(short) > 80:
+        short = short[:77] + "..."
+    return f"{mark} {short}"
+
+
 def _blacklist_line(entry: BlacklistEntry) -> str:
     mark = "🟢" if entry.is_active else "⚪"
     who = f"user_id={entry.user_id}" if entry.user_id is not None else f"tel={entry.phone_e164 or '—'}"
@@ -367,15 +385,19 @@ def _active_list_button_text(ap: Appointment) -> str:
     return line[:64]
 
 
-def _card_text(ap: Appointment, settings: Settings) -> str:
+def _card_text(ap: Appointment, settings: Settings, admin_ops_uc: AdminOpsUseCases | None = None) -> str:
     when = format_slot_utc_for_user(ap.start_datetime_utc)
     phone = ap.phone_e164 or "—"
     st = ap.status.value
+    price, duration = resolve_service_price_and_duration(
+        getattr(admin_ops_uc, "service_repo", None),
+        str(ap.service_id or ""),
+    )
     admin_line = "\n\n🛠 Создано админом" if int(ap.user_id) == 0 else ""
     return (
         f"<b>Детали записи 📄</b> ({st})\n\n"
-        f"🕐 {when}\n"
-        f"💇 {ap.service_id}\n"
+        f"📅 {when}\n"
+        f"{format_service_block(ap.service_id or '—', price, duration)}\n"
         f"👤 {ap.customer_name}\n"
         f"📞 {phone}"
         f"{admin_line}"
@@ -539,7 +561,11 @@ async def admin_callback(
         await state.update_data({ADMIN_ASSISTED_BOOKING_KEY: True})
         await callback.message.answer(
             "Запись клиента — шаг 1/5: выберите услугу.",
-            reply_markup=service_keyboard(draft.draft_id, booking_uc.list_available_services()),
+            reply_markup=service_keyboard(
+                draft.draft_id,
+                booking_uc.list_available_services(),
+                getattr(booking_uc, "service_catalog_repo", None),
+            ),
         )
         return
 
@@ -762,16 +788,136 @@ async def admin_callback(
         b.button(text="« Меню", callback_data=build_admin_home())
         b.adjust(1)
         if items:
-            preview_lines = ["\n<b>Как увидит клиент:</b>\n"]
-            for item in admin_ops_uc.list_active_services():
-                preview_lines.append(
-                    f"• {item.name}\n  Цена: {item.price_text}\n  Длительность: {_fmt_duration_minutes(item.duration_minutes)}\n"
-                )
-            preview = "\n".join(preview_lines).strip()
-            text = "<b>Каталог услуг</b>\n\n" + preview
+            text = (
+                "<b>Каталог услуг</b>\n\n"
+                "Используется для записи (выбор услуги, длительность слотов)."
+            )
         else:
             text = "<b>Каталог услуг</b>\n\nПока пусто."
         await callback.message.answer(text, reply_markup=b.as_markup())
+        return
+
+    if action == "ops_pl":
+        items = admin_ops_uc.list_price_items()
+        b = InlineKeyboardBuilder()
+        if items:
+            for item in items[:40]:
+                b.button(
+                    text=_price_line(item)[:60],
+                    callback_data=build_admin_ops_price_open(item.item_id),
+                )
+        b.button(text="➕ Добавить", callback_data=build_admin_ops_price_add())
+        b.button(text="« Меню", callback_data=build_admin_home())
+        b.adjust(1)
+        intro = (
+            "<b>Прайс (для клиентов)</b>\n\n"
+            "Здесь строки, которые видят в разделе «💸 Прайс» в клиентском меню."
+        )
+        if not items:
+            intro += "\n\nПока нет позиций."
+        await callback.message.answer(intro, reply_markup=b.as_markup())
+        return
+
+    if action == "ops_pl_add":
+        await state.set_state(AdminStates.price_add)
+        await callback.message.answer(
+            "Введите данные в формате: Название, цена\n"
+            "Пример: Маникюр, 2000",
+            reply_markup=admin_reply_keyboard(),
+        )
+        return
+
+    if action == "ops_pl_o" and parts:
+        item_id = parts[0]
+        try:
+            item = admin_ops_uc.get_price_item_or_raise(item_id)
+        except AppError as e:
+            await callback.message.answer(
+                error_to_user_message(e),
+                reply_markup=admin_reply_keyboard(),
+            )
+            return
+        b = InlineKeyboardBuilder()
+        b.button(text="Изменить", callback_data=build_admin_ops_price_edit(item_id))
+        b.button(text="Удалить", callback_data=build_admin_ops_price_delete(item_id))
+        if item.is_active:
+            b.button(text="Деактивировать", callback_data=build_admin_ops_price_deactivate(item_id))
+        else:
+            b.button(text="Активировать", callback_data=build_admin_ops_price_activate(item_id))
+        b.button(text="« К прайсу", callback_data=build_admin_ops_price_list())
+        b.adjust(1)
+        body = item.display_text.replace("<", "&lt;").replace(">", "&gt;")
+        await callback.message.answer(
+            f"<b>Позиция прайса</b>\n\n{body}",
+            reply_markup=b.as_markup(),
+        )
+        return
+
+    if action == "ops_pl_off" and parts:
+        item_id = parts[0]
+        try:
+            admin_ops_uc.deactivate_price_item(item_id)
+        except AppError as e:
+            await callback.message.answer(
+                error_to_user_message(e),
+                reply_markup=admin_reply_keyboard(),
+            )
+            return
+        await callback.message.answer(
+            "Позиция скрыта для клиентов (не удалена).",
+            reply_markup=admin_reply_keyboard(),
+        )
+        return
+
+    if action == "ops_pl_on" and parts:
+        item_id = parts[0]
+        try:
+            admin_ops_uc.activate_price_item(item_id)
+        except AppError as e:
+            await callback.message.answer(
+                error_to_user_message(e),
+                reply_markup=admin_reply_keyboard(),
+            )
+            return
+        await callback.message.answer(
+            "Позиция снова активна для клиентов.",
+            reply_markup=admin_reply_keyboard(),
+        )
+        return
+
+    if action == "ops_pl_ed" and parts:
+        item_id = parts[0]
+        try:
+            admin_ops_uc.get_price_item_or_raise(item_id)
+        except AppError as e:
+            await callback.message.answer(
+                error_to_user_message(e),
+                reply_markup=admin_reply_keyboard(),
+            )
+            return
+        await state.set_state(AdminStates.price_edit)
+        await state.update_data(ops_price_id=item_id)
+        await callback.message.answer(
+            "Введите данные в формате: Название, цена\n"
+            "Пример: Маникюр, 2000",
+            reply_markup=admin_reply_keyboard(),
+        )
+        return
+
+    if action == "ops_pl_del" and parts:
+        item_id = parts[0]
+        try:
+            admin_ops_uc.delete_price_item(item_id)
+        except AppError as e:
+            await callback.message.answer(
+                error_to_user_message(e),
+                reply_markup=admin_reply_keyboard(),
+            )
+            return
+        await callback.message.answer(
+            "Позиция прайса удалена.",
+            reply_markup=admin_reply_keyboard(),
+        )
         return
 
     if action == "ops_sv_add":
@@ -1125,9 +1271,9 @@ async def admin_callback(
             )
             return
         if ap.status == AppointmentStatus.CANCELLED:
-            await _send_cancelled_appointment_card(callback.message, ap, settings)
+            await _send_cancelled_appointment_card(callback.message, ap, settings, admin_ops_uc)
         else:
-            await _send_appointment_card(callback.message, ap, settings)
+            await _send_appointment_card(callback.message, ap, settings, admin_ops_uc)
         return
 
     if action == "x" and parts:
@@ -1338,7 +1484,7 @@ async def admin_callback(
             "Услуга обновлена.",
             reply_markup=admin_reply_keyboard(),
         )
-        await _send_appointment_card(callback.message, ap, settings)
+        await _send_appointment_card(callback.message, ap, settings, admin_ops_uc)
         return
 
     if action == "dt" and len(parts) >= 2:
@@ -1369,7 +1515,7 @@ async def admin_callback(
             "Дата обновлена (время сохранено).",
             reply_markup=admin_reply_keyboard(),
         )
-        await _send_appointment_card(callback.message, ap, settings)
+        await _send_appointment_card(callback.message, ap, settings, admin_ops_uc)
         return
 
     if action == "tm" and len(parts) >= 2:
@@ -1404,7 +1550,7 @@ async def admin_callback(
             "Время обновлено.",
             reply_markup=admin_reply_keyboard(),
         )
-        await _send_appointment_card(callback.message, ap, settings)
+        await _send_appointment_card(callback.message, ap, settings, admin_ops_uc)
         return
 
     if action == "nm" and parts:
@@ -1515,6 +1661,7 @@ async def _send_appointment_card(
     message: Message,
     ap: Appointment,
     settings: Settings,
+    admin_ops_uc: AdminOpsUseCases | None = None,
 ) -> None:
     b = InlineKeyboardBuilder()
     if ap.status != AppointmentStatus.CANCELLED:
@@ -1522,19 +1669,20 @@ async def _send_appointment_card(
         b.button(text="🔁 Перенести", callback_data=build_admin_move_start(ap.appointment_id))
     b.button(text="« Меню", callback_data=build_admin_home())
     b.adjust(1)
-    await message.answer(_card_text(ap, settings), reply_markup=b.as_markup())
+    await message.answer(_card_text(ap, settings, admin_ops_uc), reply_markup=b.as_markup())
 
 
 async def _send_cancelled_appointment_card(
     message: Message,
     ap: Appointment,
     settings: Settings,
+    admin_ops_uc: AdminOpsUseCases | None = None,
 ) -> None:
     b = InlineKeyboardBuilder()
     b.button(text="🚫 В blacklist", callback_data=build_admin_blacklist_from_appointment(ap.appointment_id))
     b.button(text="« К отменённым", callback_data=build_admin_cancelled())
     b.adjust(1)
-    await message.answer(_card_text(ap, settings), reply_markup=b.as_markup())
+    await message.answer(_card_text(ap, settings, admin_ops_uc), reply_markup=b.as_markup())
 
 
 def _blacklist_card_text(entry: BlacklistEntry) -> str:
@@ -1959,6 +2107,69 @@ async def admin_service_edit_price(
     )
 
 
+@router.message(AdminStates.price_add, F.text)
+async def admin_price_add(
+    message: Message,
+    state: FSMContext,
+    settings: Settings,
+    admin_ops_uc: AdminOpsUseCases,
+) -> None:
+    uid = message.from_user.id if message.from_user else None
+    if not _is_admin(uid, settings):
+        await state.clear()
+        return
+    raw = (message.text or "").strip()
+    try:
+        admin_ops_uc.add_price_item(raw)
+    except AppError as e:
+        await message.answer(
+            error_to_user_message(e) + _ADMIN_FSM_TIME_HINT,
+            reply_markup=admin_reply_keyboard(),
+        )
+        return
+    await state.clear()
+    await message.answer(
+        "Позиция прайса добавлена.",
+        reply_markup=admin_reply_keyboard(),
+    )
+
+
+@router.message(AdminStates.price_edit, F.text)
+async def admin_price_edit(
+    message: Message,
+    state: FSMContext,
+    settings: Settings,
+    admin_ops_uc: AdminOpsUseCases,
+) -> None:
+    uid = message.from_user.id if message.from_user else None
+    if not _is_admin(uid, settings):
+        await state.clear()
+        return
+    data = await state.get_data()
+    item_id = str(data.get("ops_price_id") or "")
+    if not item_id:
+        await state.clear()
+        await message.answer(
+            "Сессия устарела.",
+            reply_markup=admin_reply_keyboard(),
+        )
+        return
+    raw = (message.text or "").strip()
+    try:
+        admin_ops_uc.update_price_item_text(item_id, raw)
+    except AppError as e:
+        await message.answer(
+            error_to_user_message(e) + _ADMIN_FSM_TIME_HINT,
+            reply_markup=admin_reply_keyboard(),
+        )
+        return
+    await state.clear()
+    await message.answer(
+        "Позиция прайса обновлена.",
+        reply_markup=admin_reply_keyboard(),
+    )
+
+
 @router.message(AdminStates.blacklist_add, F.text)
 async def admin_blacklist_add(
     message: Message,
@@ -2089,6 +2300,7 @@ async def admin_save_name(
     state: FSMContext,
     settings: Settings,
     appointment_uc: AppointmentUseCases,
+    admin_ops_uc: AdminOpsUseCases,
 ) -> None:
     uid = message.from_user.id if message.from_user else None
     if not _is_admin(uid, settings):
@@ -2116,7 +2328,7 @@ async def admin_save_name(
         "Имя сохранено.",
         reply_markup=admin_reply_keyboard(),
     )
-    await _send_appointment_card(message, ap, settings)
+    await _send_appointment_card(message, ap, settings, admin_ops_uc)
 
 
 @router.message(AdminStates.edit_phone, F.text)
@@ -2125,6 +2337,7 @@ async def admin_save_phone(
     state: FSMContext,
     settings: Settings,
     appointment_uc: AppointmentUseCases,
+    admin_ops_uc: AdminOpsUseCases,
 ) -> None:
     uid = message.from_user.id if message.from_user else None
     if not _is_admin(uid, settings):
@@ -2152,4 +2365,4 @@ async def admin_save_phone(
         "Телефон сохранён.",
         reply_markup=admin_reply_keyboard(),
     )
-    await _send_appointment_card(message, ap, settings)
+    await _send_appointment_card(message, ap, settings, admin_ops_uc)

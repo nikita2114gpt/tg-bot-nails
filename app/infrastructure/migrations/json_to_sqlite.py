@@ -313,6 +313,52 @@ def migrate_json_to_sqlite(json_path: str | Path, db_path: str | Path) -> None:
                 flush=True,
             )
 
+    # 6.5) Прайс (отдельная таблица; читаем полный JSON).
+    try:
+        if json_path.exists():
+            with json_path.open("r", encoding="utf-8") as f:
+                full_raw = json.load(f)
+        else:
+            full_raw = {}
+    except Exception:
+        full_raw = {}
+    pl_items = (
+        full_raw.get("price_list")
+        if isinstance(full_raw, dict) and isinstance(full_raw.get("price_list"), list)
+        else []
+    )
+    from app.domain.ops_models import PriceListItem
+    from app.infrastructure.storage_sqlite import PriceListRepository
+
+    price_repo = PriceListRepository(db_path=db_path)
+    for row in pl_items:
+        if not isinstance(row, dict):
+            continue
+        item_id = row.get("item_id")
+        if not isinstance(item_id, str) or not item_id:
+            continue
+        item = PriceListItem(
+            item_id=item_id,
+            display_text=str(row.get("display_text") or ""),
+            is_active=bool(row.get("is_active", True)),
+            created_at=row.get("created_at") if isinstance(row.get("created_at"), str) else _now_iso(),
+            updated_at=row.get("updated_at") if isinstance(row.get("updated_at"), str) else _now_iso(),
+        )
+        try:
+            price_repo.save(item)
+        except sqlite3.IntegrityError as e:
+            had_errors = True
+            print(
+                f"init: json->sqlite migration: failed price_list item_id={item_id}. error={e}",
+                flush=True,
+            )
+        except Exception as e:
+            had_errors = True
+            print(
+                f"init: json->sqlite migration: unexpected error price_list item_id={item_id}. error={e}",
+                flush=True,
+            )
+
     # 7) Ставим маркер только если не было ошибок сохранения.
     if had_errors:
         print(

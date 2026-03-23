@@ -5,12 +5,38 @@ from app.presentation.callback.booking_callbacks import build_callback
 from app.presentation.callback.nav_callbacks import build_admin_move_date, build_admin_open
 
 
-def service_keyboard(draft_id: str, services: list[str]) -> InlineKeyboardMarkup:
+def _fmt_duration_minutes(value: int) -> str:
+    h = value // 60
+    m = value % 60
+    if h > 0 and m > 0:
+        return f"{h} ч {m} мин"
+    if h > 0:
+        return f"{h} ч"
+    return f"{m} мин"
+
+
+def service_keyboard(draft_id: str, services: list[str], service_repo=None) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
+    duration_by_name: dict[str, str] = {}
+    if service_repo is not None:
+        try:
+            for item in service_repo.list_all():
+                name = (getattr(item, "name", "") or "").strip()
+                if not name:
+                    continue
+                duration = int(getattr(item, "duration_minutes", 0) or 0)
+                if duration > 0:
+                    duration_by_name[name] = _fmt_duration_minutes(duration)
+        except Exception:
+            duration_by_name = {}
 
     for service in services:
+        label = service
+        dur = duration_by_name.get(service)
+        if dur:
+            label = f"{service} — {dur}"
         builder.button(
-            text=service,
+            text=label,
             callback_data=build_callback("svc", draft_id, service),
         )
 

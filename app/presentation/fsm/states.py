@@ -27,3 +27,5 @@ class AdminStates(StatesGroup):
     day_schedule_step = State()
     salon_address = State()
     salon_contacts = State()
+    price_add = State()
+    price_edit = State()

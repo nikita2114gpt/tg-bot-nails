@@ -1,0 +1,138 @@
+warning: in the working copy of 'app/application/appointment_uc.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'app/application/booking_uc.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'app/presentation/callback/nav_callbacks.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'app/presentation/handlers/admin_handlers.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'app/presentation/handlers/booking_handlers.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'app/presentation/handlers/client_menu_handlers.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'app/presentation/handlers/common_handlers.py', LF will be replaced by CRLF the next time Git touches it
+[1mdiff --git a/app/application/appointment_uc.py b/app/application/appointment_uc.py[m
+[1mindex 3ca523b..eb8c0a0 100644[m
+[1m--- a/app/application/appointment_uc.py[m
+[1m+++ b/app/application/appointment_uc.py[m
+[36m@@ -201,6 +201,17 @@[m [mclass AppointmentUseCases:[m
+     def admin_list_cancelled(self) -> list[Appointment]:[m
+         return self._list_by_status(AppointmentStatus.CANCELLED)[m
+ [m
+[32m+[m[32m    def admin_list_active_confirmed(self) -> list[Appointment]:[m
+[32m+[m[32m        """Будущие подтверждённые записи (для быстрого списка в админке)."""[m
+[32m+[m[32m        now_key = datetime.utcnow().strftime("%Y%m%dT%H%M")[m
+[32m+[m[32m        items = [[m
+[32m+[m[32m            a[m
+[32m+[m[32m            for a in self._list_by_status(AppointmentStatus.CONFIRMED)[m
+[32m+[m[32m            if (a.start_datetime_utc or "") >= now_key[m
+[32m+[m[32m        ][m
+[32m+[m[32m        items.sort(key=lambda x: (x.start_datetime_utc or "", x.appointment_id or ""))[m
+[32m+[m[32m        return items[m
+[32m+[m
+     def admin_search(self, raw_query: str) -> list[Appointment]:[m
+         q = (raw_query or "").strip()[m
+         if not q:[m
+[1mdiff --git a/app/application/booking_uc.py b/app/application/booking_uc.py[m
+[1mindex 53784d9..29db5af 100644[m
+[1m--- a/app/application/booking_uc.py[m
+[1m+++ b/app/application/booking_uc.py[m
+[36m@@ -163,6 +163,18 @@[m [mclass BookingUseCases:[m
+         if start_datetime_utc < now_key:[m
+             raise UserInputError("Нельзя выбрать прошедшее время")[m
+ [m
+[32m+[m[32m        try:[m
+[32m+[m[32m            fn = getattr(self.appointment_repo, "get_by_start_datetime_utc", None)[m
+[32m+[m[32m            existing_for_slot = fn(start_datetime_utc) if callable(fn) else None[m
+[32m+[m[32m        except Exception:[m
+[32m+[m[32m            existing_for_slot = None[m
+[32m+[m[32m        if ([m
+[32m+[m[32m            existing_for_slot is not None[m
+[32m+[m[32m            and existing_for_slot.status == AppointmentStatus.CONFIRMED[m
+[32m+[m[32m            and getattr(existing_for_slot, "draft_id", None) != draft.draft_id[m
+[32m+[m[32m        ):[m
+[32m+[m[32m            raise ConflictError("Это время уже занято, выберите другое.")[m
+[32m+[m
+         updated = replace([m
+             draft,[m
+             appointment_time=time_value,[m
+[1mdiff --git a/app/infrastructure/telegram_sender.py b/app/infrastructure/telegram_sender.py[m
+[1mindex 0059517..ac28c09 100644[m
+[1m--- a/app/infrastructure/telegram_sender.py[m
+[1m+++ b/app/infrastructure/telegram_sender.py[m
+[36m@@ -1,6 +1,8 @@[m
+ from app.domain.models import OutboxEvent[m
+ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup[m
+[31m-from app.presentation.callback.reminder_callbacks import build_reminder_cancel, build_reminder_confirm[m
+[32m+[m
+[32m+[m[32mfrom app.presentation.keyboards.main_menu_kb import BTN_BOOK[m
+[32m+[m[32mfrom app.presentation.keyboards.reminder_kb import client_reminder_24h_keyboard[m
+ [m
+ [m
+ class TelegramSender:[m
+[36m@@ -69,7 +71,7 @@[m [mclass TelegramSender:[m
+             )[m
+             kb = InlineKeyboardMarkup([m
+                 inline_keyboard=[[m
+[31m-                    [InlineKeyboardButton(text="📅 Записаться", callback_data="c1|book")][m
+[32m+[m[32m                    [InlineKeyboardButton(text=BTN_BOOK, callback_data="c1|book")][m
+                 ][m
+             )[m
+             await self.bot.send_message(user_id, text, reply_markup=kb)[m
+[36m@@ -90,13 +92,7 @@[m [mclass TelegramSender:[m
+                 f"Дата/время: {_fmt_slot(start_datetime_utc)}\n\n"[m
+                 "Подтвердите, пожалуйста, что запись актуальна."[m
+             )[m
+[31m-            kb = InlineKeyboardMarkup([m
+[31m-                inline_keyboard=[[m
+[31m-                    [InlineKeyboardButton(text="✅ Подтверждаю", callback_data=build_reminder_confirm(appointment_id))],[m
+[31m-                    [InlineKeyboardButton(text="❌ Отменить запись", callback_data=build_reminder_cancel(appointment_id))],[m
+[31m-                    [InlineKeyboardButton(text="📞 Позвонить", url=f"tel:{phone_e164}")],[m
+[31m-                ][m
+[31m-            )[m
+[32m+[m[32m            kb = client_reminder_24h_keyboard(appointment_id, phone_e164)[m
+             await self.bot.send_message(user_id, text, reply_markup=kb)[m
+             return[m
+ [m
+[1mdiff --git a/app/presentation/callback/nav_callbacks.py b/app/presentation/callback/nav_callbacks.py[m
+[1mindex 37bd282..287c488 100644[m
+[1m--- a/app/presentation/callback/nav_callbacks.py[m
+[1m+++ b/app/presentation/callback/nav_callbacks.py[m
+[36m@@ -37,6 +37,14 @@[m [mdef build_admin_cancelled() -> str:[m
+     return "a1|cn"[m
+ [m
+ [m
+[32m+[m[32mdef build_admin_active() -> str:[m
+[32m+[m[32m    return "a1|ac"[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef build_admin_active_page(page: int) -> str:[m
+[32m+[m[32m    return f"a1|acp|{page}"[m
+[32m+[m
+[32m+[m
+ def build_admin_search() -> str:[m
+     return "a1|sr"[m
+ [m
+[1mdiff --git a/app/presentation/handlers/admin_handlers.py b/app/presentation/handlers/admin_handlers.py[m
+[1mindex b45cb53..d10c532 100644[m
+[1m--- a/app/presentation/handlers/admin_handlers.py[m
+[1m+++ b/app/presentation/handlers/admin_handlers.py[m
+[36m@@ -16,6 +16,8 @@[m [mfrom app.domain.enums import AppointmentStatus[m
+ from app.domain.models import Appointment[m
+ from app.domain.ops_models import BlacklistEntry, ScheduleSettings, ServiceCatalogItem[m
+ from app.presentation.callback.nav_callbacks import ([m
+[32m+[m[32m    build_admin_active,[m
+[32m+[m[32m    build_admin_active_page,[m
+     build_admin_cancel_appt,[m
+     build_admin_edit_menu,[m
+     build_admin_edit_name,[m
+[36m@@ -130,14 +132,15 @@[m [mdef _slots_for_schedule(open_hhmm: str, close_hhmm: str, step: int) -> list[str][m
+ [m
+ def _home_keyboard() -> InlineKeyboardBuilder:[m
+     b = InlineKeyboardBuilder()[m
+[31m-    b.button(text="Записи", callback_data=build_admin_records())[m
+[31m-    b.button(text="Отменённые", callback_data=build_admin_cancelled())[m
+[31m-    b.button(text="Поиск", callback_data=build_admin_search())[m
+[31m-    b.button(text="Расписание", callback_data=build_admin_ops_schedule())[m
+[31m-    b.button(text="Адрес / Контакты", callback_data=build_admin_ops_salon())[m
+[31m-    b.button(text="Услуги", callback_data=build_admin_ops_services())[m
+[31m-    b.button(text="Blacklist", callback_data=build_admin_ops_blacklist())[m
+[31m-    b.adjust(1, 2, 2, 2)[m
+[32m+[m[32m    b.button(text="📋 Записи", callback_data=build_admin_records())[m
+[32m+[m[32m    b.button(text="Активные записи", callback_data=build_admin_active())[m
+[32m+[m[32m    b.button(text="🔁 Отменённые", callback_data=build_admin_cancelled())[m
+[32m+[m[

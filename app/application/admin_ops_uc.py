@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime
+import re
 from typing import Optional
 
 from app.core.errors import ConflictError, NotFoundError, UserInputError
 from app.domain.ops_models import (
     BlacklistEntry,
     DayScheduleOverride,
+    PriceListItem,
     SalonInfoSettings,
     ScheduleSettings,
     ServiceCatalogItem,
@@ -52,12 +54,105 @@ class AdminOpsUseCases:
         blacklist_repo,
         day_schedule_repo=None,
         salon_info_repo=None,
+        price_list_repo=None,
     ) -> None:
         self.schedule_repo = schedule_repo
         self.service_repo = service_repo
         self.blacklist_repo = blacklist_repo
         self.day_schedule_repo = day_schedule_repo
         self.salon_info_repo = salon_info_repo
+        self.price_list_repo = price_list_repo
+
+    def list_price_items(self) -> list[PriceListItem]:
+        if self.price_list_repo is None:
+            return []
+        return self.price_list_repo.list_all()
+
+    def list_active_price_items(self) -> list[PriceListItem]:
+        if self.price_list_repo is None:
+            return []
+        return self.price_list_repo.list_active()
+
+    def get_price_item_or_raise(self, item_id: str) -> PriceListItem:
+        if self.price_list_repo is None:
+            raise ConflictError("Раздел прайса недоступен.")
+        item = self.price_list_repo.get_by_id(item_id)
+        if item is None:
+            raise NotFoundError("Позиция прайса не найдена.")
+        return item
+
+    def parse_price_display_text(self, raw: str) -> str:
+        text = (raw or "").strip()
+        if not text:
+            raise UserInputError(
+                "Некорректный формат. Используйте: Название, цена."
+            )
+        if len(text) > 2000:
+            raise UserInputError("Текст слишком длинный.")
+
+        pattern = (
+            r"^\s*(?P<title>[^,]+?)\s*,\s*"
+            r"(?P<price>\d[\d\s]*(?:[.,]\d+)?\s*(?:₽|руб\.?|р\.?)?)"
+            r"\s*$"
+        )
+        m = re.match(pattern, text, flags=re.IGNORECASE)
+        if m is None:
+            raise UserInputError(
+                "Некорректный формат. Используйте: Название, цена.\n"
+                "Пример: Маникюр, 2000"
+            )
+
+        title = re.sub(r"\s+", " ", (m.group("title") or "").strip())
+        price = re.sub(r"\s+", " ", (m.group("price") or "").strip())
+        if not title:
+            raise UserInputError("Название обязательно.")
+        if not price:
+            raise UserInputError("Цена обязательна.")
+
+        return "\n".join([title, f"Цена: {price}"])
+
+    def add_price_item(self, raw: str) -> PriceListItem:
+        if self.price_list_repo is None:
+            raise ConflictError("Раздел прайса недоступен.")
+        display = self.parse_price_display_text(raw)
+        item = PriceListItem(display_text=display, is_active=True)
+        self.price_list_repo.save(item)
+        return item
+
+    def update_price_item_text(self, item_id: str, raw: str) -> PriceListItem:
+        if self.price_list_repo is None:
+            raise ConflictError("Раздел прайса недоступен.")
+        current = self.get_price_item_or_raise(item_id)
+        display = self.parse_price_display_text(raw)
+        updated = replace(
+            current,
+            display_text=display,
+            updated_at=_now_iso(),
+        )
+        self.price_list_repo.save(updated)
+        return updated
+
+    def deactivate_price_item(self, item_id: str) -> PriceListItem:
+        if self.price_list_repo is None:
+            raise ConflictError("Раздел прайса недоступен.")
+        current = self.get_price_item_or_raise(item_id)
+        updated = replace(current, is_active=False, updated_at=_now_iso())
+        self.price_list_repo.save(updated)
+        return updated
+
+    def activate_price_item(self, item_id: str) -> PriceListItem:
+        if self.price_list_repo is None:
+            raise ConflictError("Раздел прайса недоступен.")
+        current = self.get_price_item_or_raise(item_id)
+        updated = replace(current, is_active=True, updated_at=_now_iso())
+        self.price_list_repo.save(updated)
+        return updated
+
+    def delete_price_item(self, item_id: str) -> None:
+        if self.price_list_repo is None:
+            raise ConflictError("Раздел прайса недоступен.")
+        self.get_price_item_or_raise(item_id)
+        self.price_list_repo.delete(item_id)
 
     def get_schedule(self) -> ScheduleSettings:
         return self.schedule_repo.get()
@@ -234,8 +329,11 @@ class AdminOpsUseCases:
 
     def add_service(self, name: str, duration_minutes: int, price_text: str) -> ServiceCatalogItem:
         clean_name = (name or "").strip()
+        clean_price = (price_text or "").strip()
         if not clean_name:
             raise UserInputError("Название услуги не может быть пустым.")
+        if not clean_price or clean_price == "—":
+            raise UserInputError("Цена услуги обязательна.")
         if duration_minutes <= 0 or duration_minutes > 24 * 60:
             raise UserInputError("Некорректная длительность услуги.")
         if duration_minutes % 30 != 0:
@@ -243,7 +341,7 @@ class AdminOpsUseCases:
         item = ServiceCatalogItem(
             name=clean_name,
             duration_minutes=duration_minutes,
-            price_text=(price_text or "—").strip() or "—",
+            price_text=clean_price,
             is_active=True,
         )
         self.service_repo.save_item(item)

@@ -107,6 +107,34 @@ def build_admin_ops_services() -> str:
     return "a1|ops_sv"
 
 
+def build_admin_ops_price_list() -> str:
+    return "a1|ops_pl"
+
+
+def build_admin_ops_price_add() -> str:
+    return "a1|ops_pl_add"
+
+
+def build_admin_ops_price_open(item_id: str) -> str:
+    return f"a1|ops_pl_o|{item_id}"
+
+
+def build_admin_ops_price_edit(item_id: str) -> str:
+    return f"a1|ops_pl_ed|{item_id}"
+
+
+def build_admin_ops_price_delete(item_id: str) -> str:
+    return f"a1|ops_pl_del|{item_id}"
+
+
+def build_admin_ops_price_deactivate(item_id: str) -> str:
+    return f"a1|ops_pl_off|{item_id}"
+
+
+def build_admin_ops_price_activate(item_id: str) -> str:
+    return f"a1|ops_pl_on|{item_id}"
+
+
 def build_admin_ops_blacklist() -> str:
     return "a1|ops_bl"
 

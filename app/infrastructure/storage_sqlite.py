@@ -10,6 +10,7 @@ from app.domain.ops_models import (
     BlacklistEntry,
     ClientLifecycleMarker,
     DayScheduleOverride,
+    PriceListItem,
     SalonInfoSettings,
     ScheduleSettings,
     ServiceCatalogItem,
@@ -262,6 +263,24 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         )
     except sqlite3.OperationalError:
         pass
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS price_list_items (
+            item_id TEXT PRIMARY KEY,
+            display_text TEXT NOT NULL,
+            is_active INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_price_list_active_created
+        ON price_list_items(is_active, created_at ASC);
+        """
+    )
 
 
 def _draft_from_row(row: sqlite3.Row) -> Optional[BookingDraft]:
@@ -629,6 +648,34 @@ class AppointmentRepository:
                     appointment.created_at,
                     appointment.updated_at,
                 ),
+            )
+            if appointment.status == AppointmentStatus.CANCELLED:
+                self._trim_cancelled_overflow(conn)
+
+    def _trim_cancelled_overflow(self, conn: sqlite3.Connection) -> None:
+        """Не более 500 отменённых записей: удаляем самые старые по created_at."""
+        row = conn.execute(
+            "SELECT COUNT(*) FROM appointments WHERE status=?",
+            (AppointmentStatus.CANCELLED.value,),
+        ).fetchone()
+        n = int(row[0]) if row else 0
+        if n <= 500:
+            return
+        to_delete = n - 500
+        old_rows = conn.execute(
+            """
+            SELECT appointment_id FROM appointments
+            WHERE status=?
+            ORDER BY created_at ASC, appointment_id ASC
+            LIMIT ?
+            """,
+            (AppointmentStatus.CANCELLED.value, to_delete),
+        ).fetchall()
+        for r in old_rows:
+            aid = r["appointment_id"] if hasattr(r, "keys") else r[0]
+            conn.execute(
+                "DELETE FROM appointments WHERE appointment_id=?",
+                (aid,),
             )
 
     def get_by_draft_id(self, draft_id: str) -> Optional[Appointment]:
@@ -1323,5 +1370,94 @@ class ClientLifecycleMarkerRepository:
                     marker.last_phone_e164,
                     marker.updated_at,
                 ),
+            )
+
+
+def _price_item_from_row(row: sqlite3.Row | None) -> Optional[PriceListItem]:
+    if row is None:
+        return None
+    return PriceListItem(
+        item_id=row["item_id"],
+        display_text=row["display_text"] or "",
+        is_active=bool(int(row["is_active"] or 0)),
+        created_at=row["created_at"] if isinstance(row["created_at"], str) else _now_iso(),
+        updated_at=row["updated_at"] if isinstance(row["updated_at"], str) else _now_iso(),
+    )
+
+
+class PriceListRepository:
+    def __init__(self, db_path: str | Path):
+        self._db_path = Path(db_path)
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        with _connect(self._db_path) as conn:
+            _init_schema(conn)
+
+    def list_all(self) -> list[PriceListItem]:
+        with _connect(self._db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM price_list_items
+                ORDER BY created_at DESC, item_id DESC
+                """
+            ).fetchall()
+            out: list[PriceListItem] = []
+            for row in rows:
+                item = _price_item_from_row(row)
+                if item is not None:
+                    out.append(item)
+            return out
+
+    def list_active(self) -> list[PriceListItem]:
+        with _connect(self._db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM price_list_items
+                WHERE is_active=1
+                ORDER BY created_at ASC, item_id ASC
+                """
+            ).fetchall()
+            out: list[PriceListItem] = []
+            for row in rows:
+                item = _price_item_from_row(row)
+                if item is not None:
+                    out.append(item)
+            return out
+
+    def get_by_id(self, item_id: str) -> Optional[PriceListItem]:
+        with _connect(self._db_path) as conn:
+            row = conn.execute(
+                "SELECT * FROM price_list_items WHERE item_id=? LIMIT 1",
+                (item_id,),
+            ).fetchone()
+            return _price_item_from_row(row)
+
+    def save(self, item: PriceListItem) -> None:
+        with _connect(self._db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO price_list_items (
+                    item_id, display_text, is_active, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(item_id) DO UPDATE SET
+                    display_text=excluded.display_text,
+                    is_active=excluded.is_active,
+                    created_at=excluded.created_at,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    item.item_id,
+                    item.display_text,
+                    1 if item.is_active else 0,
+                    item.created_at,
+                    item.updated_at,
+                ),
+            )
+
+    def delete(self, item_id: str) -> None:
+        with _connect(self._db_path) as conn:
+            conn.execute(
+                "DELETE FROM price_list_items WHERE item_id=?",
+                (item_id,),
             )
 

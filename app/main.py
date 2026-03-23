@@ -19,6 +19,7 @@ from app.infrastructure.storage_filejson import (
     DayScheduleOverrideRepository,
     DraftRepository,
     OutboxRepository,
+    PriceListRepository,
     SalonInfoSettingsRepository,
     ScheduleSettingsRepository,
     ServiceCatalogRepository,
@@ -30,6 +31,7 @@ from app.infrastructure.storage_sqlite import (
     DayScheduleOverrideRepository as SqliteDayScheduleOverrideRepository,
     DraftRepository as SqliteDraftRepository,
     OutboxRepository as SqliteOutboxRepository,
+    PriceListRepository as SqlitePriceListRepository,
     SalonInfoSettingsRepository as SqliteSalonInfoSettingsRepository,
     ScheduleSettingsRepository as SqliteScheduleSettingsRepository,
     ServiceCatalogRepository as SqliteServiceCatalogRepository,
@@ -79,6 +81,7 @@ async def main():
             blacklist_repo = SqliteBlacklistRepository(db_path=sqlite_db_path)
             lifecycle_repo = SqliteClientLifecycleMarkerRepository(db_path=sqlite_db_path)
             salon_info_repo = SqliteSalonInfoSettingsRepository(db_path=sqlite_db_path)
+            price_list_repo = SqlitePriceListRepository(db_path=sqlite_db_path)
             print("init: storage backend = sqlite", flush=True)
 
             # One-time migration for legacy JSON storage.
@@ -109,6 +112,7 @@ async def main():
             blacklist_repo = BlacklistRepository()
             lifecycle_repo = ClientLifecycleMarkerRepository()
             salon_info_repo = SalonInfoSettingsRepository()
+            price_list_repo = PriceListRepository()
     else:
         draft_repo = DraftRepository()
         appointment_repo = AppointmentRepository()
@@ -119,6 +123,7 @@ async def main():
         blacklist_repo = BlacklistRepository()
         lifecycle_repo = ClientLifecycleMarkerRepository()
         salon_info_repo = SalonInfoSettingsRepository()
+        price_list_repo = PriceListRepository()
 
     print("init: create booking use-cases", flush=True)
     booking_uc = BookingUseCases(
@@ -137,6 +142,7 @@ async def main():
         allowed_services=settings.services,
         outbox_repo=outbox_repo,
         lifecycle_repo=lifecycle_repo,
+        service_catalog_repo=service_catalog_repo,
     )
     admin_ops_uc = AdminOpsUseCases(
         schedule_repo=schedule_repo,
@@ -144,6 +150,7 @@ async def main():
         blacklist_repo=blacklist_repo,
         day_schedule_repo=day_schedule_repo,
         salon_info_repo=salon_info_repo,
+        price_list_repo=price_list_repo,
     )
 
     print("init: create telegram sender", flush=True)

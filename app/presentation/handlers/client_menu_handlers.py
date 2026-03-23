@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import html
+import re
+
 from aiogram import F, Router
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -9,6 +12,10 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from app.application.admin_ops_uc import AdminOpsUseCases
 from app.application.appointment_uc import AppointmentUseCases, format_slot_utc_for_user
 from app.application.booking_uc import BookingUseCases
+from app.application.service_catalog_view import (
+    format_service_block,
+    resolve_service_price_and_duration,
+)
 from app.config import Settings
 from app.core.errors import AppError, ConflictError, error_to_user_message
 from app.domain.enums import AppointmentStatus
@@ -28,7 +35,7 @@ from app.presentation.keyboards.main_menu_kb import (
     BTN_MAIN_MENU,
     BTN_MENU,
     BTN_MY_APPT,
-    BTN_SERVICES_INFO,
+    BTN_PRICE_LIST,
     main_menu_reply_keyboard,
 )
 
@@ -53,32 +60,62 @@ def _fmt_duration_minutes(value: int) -> str:
     return f"{m} мин"
 
 
-def _service_card_lines(
-    settings: Settings,
-    booking_uc: BookingUseCases,
-    admin_ops_uc: AdminOpsUseCases,
-) -> str:
+def _price_list_client_text(admin_ops_uc: AdminOpsUseCases) -> str:
+    def _parse_price_block(raw: str) -> tuple[str, str, str | None]:
+        text = (raw or "").strip()
+        if not text:
+            return "—", "—", None
+        title = text.splitlines()[0].strip() or text
+        price: str | None = None
+        duration: str | None = None
+
+        m_price = re.search(r"(?:цена)\s*[:\-]?\s*([^\n]+)", text, flags=re.IGNORECASE)
+        if m_price:
+            price = m_price.group(1).strip()
+        m_dur = re.search(r"(?:длительность)\s*[:\-]?\s*([^\n]+)", text, flags=re.IGNORECASE)
+        if m_dur:
+            duration = m_dur.group(1).strip()
+        if duration is None:
+            m_paren = re.search(r"\(([^)]*(?:мин|ч|час)[^)]*)\)", text, flags=re.IGNORECASE)
+            if m_paren:
+                duration = m_paren.group(1).strip()
+
+        if "," in text and price is None:
+            parts = [x.strip() for x in text.split(",") if x.strip()]
+            if parts:
+                title = parts[0]
+            if len(parts) >= 2:
+                price = parts[1]
+            if len(parts) >= 3 and duration is None:
+                duration = parts[2]
+
+        if price is None:
+            m_num = re.search(r"(\d[\d\s]*(?:[.,]\d+)?\s*(?:₽|руб\.?|р\.?)?)", text, flags=re.IGNORECASE)
+            if m_num:
+                price = m_num.group(1).strip()
+        if not price:
+            price = "—"
+        if duration:
+            duration = duration.strip()
+        return title, price, duration or None
+
     try:
-        active_items = admin_ops_uc.list_active_services()
+        items = admin_ops_uc.list_active_price_items()
     except Exception:
-        active_items = []
-
-    if active_items:
-        lines = ["<b>Прайс ✨</b>\n"]
-        for item in active_items:
-            lines.append(
-                f"• {item.name}\n"
-                f"  Цена: {item.price_text}\n"
-                f"  Длительность: {_fmt_duration_minutes(item.duration_minutes)}\n"
-            )
-        return "\n".join(lines).strip()
-
-    lines = ["<b>Прайс ✨</b>\n"]
-    for svc in booking_uc.list_available_services():
-        price = settings.service_price_text.get(svc, "—")
-        dur = settings.service_duration_text.get(svc, "—")
-        lines.append(f"• {svc}\n  Цена: {price}\n  Длительность: {dur}\n")
-    return "\n".join(lines).strip()
+        items = []
+    if not items:
+        return "<b>Прайс ✨</b>\n\nПока нет позиций — загляните позже."
+    blocks: list[str] = []
+    for item in items:
+        title, price, duration = _parse_price_block(item.display_text)
+        block_lines = [
+            f"• {html.escape(title)}",
+            f"Цена: {html.escape(price)}",
+        ]
+        if duration:
+            block_lines.append(f"Длительность: {html.escape(duration)}")
+        blocks.append("\n".join(block_lines))
+    return "<b>Прайс ✨</b>\n\n" + "\n\n".join(blocks)
 
 
 def _contacts_text(settings: Settings, admin_ops_uc: AdminOpsUseCases) -> str:
@@ -94,16 +131,10 @@ def _contacts_text(settings: Settings, admin_ops_uc: AdminOpsUseCases) -> str:
 
 
 def _my_appt_text(settings: Settings, ap, admin_ops_uc: AdminOpsUseCases) -> str:
-    price = settings.service_price_text.get(ap.service_id, "—")
-    dur = settings.service_duration_text.get(ap.service_id, "—")
-    try:
-        for item in admin_ops_uc.list_services():
-            if item.name == ap.service_id:
-                price = item.price_text or price
-                dur = _fmt_duration_minutes(item.duration_minutes)
-                break
-    except Exception:
-        pass
+    price, dur = resolve_service_price_and_duration(
+        getattr(admin_ops_uc, "service_repo", None),
+        str(ap.service_id or ""),
+    )
     when = format_slot_utc_for_user(ap.start_datetime_utc)
     admin_line = ""
     try:
@@ -115,9 +146,9 @@ def _my_appt_text(settings: Settings, ap, admin_ops_uc: AdminOpsUseCases) -> str
         "<b>Ваша активная запись 📌</b>\n"
         "Ниже указаны все актуальные данные.\n\n"
         f"📅 Дата и время: {when}\n"
-        f"💇 Услуга: {ap.service_id}\n"
-        f"💰 Цена: {price}\n"
-        f"⏱ Длительность: {dur}"
+        f"{format_service_block(ap.service_id or '—', price, dur)}\n"
+        f"👤 Клиент: {ap.customer_name or '—'}\n"
+        f"📞 Телефон: {ap.phone_e164 or '—'}"
         f"{admin_line}"
     )
 
@@ -187,7 +218,11 @@ async def start_booking_from_menu(
     perf.mark("after_set_state_choose_service")
     sent = await message.answer(
         "Шаг 1/5 — выберите услугу",
-        reply_markup=service_keyboard(draft.draft_id, booking_uc.list_available_services()),
+        reply_markup=service_keyboard(
+            draft.draft_id,
+            booking_uc.list_available_services(),
+            getattr(booking_uc, "service_catalog_repo", None),
+        ),
     )
     perf.mark("after_answer_service_keyboard")
     await remember_booking_ui_message(state, sent)
@@ -233,19 +268,13 @@ async def my_appointment(
     perf.mark("done_with_active")
 
 
-@router.message(F.text == BTN_SERVICES_INFO, ~StateFilter(AdminStates))
-async def services_info(
+@router.message(F.text == BTN_PRICE_LIST, ~StateFilter(AdminStates))
+async def client_price_list(
     message: Message,
-    settings: Settings,
-    booking_uc: BookingUseCases,
     admin_ops_uc: AdminOpsUseCases,
 ) -> None:
-    perf = PerfSpan("client_services_info")
-    perf.mark("handler_entry")
-    text = _service_card_lines(settings, booking_uc, admin_ops_uc)
-    perf.mark("after_build_service_card")
+    text = _price_list_client_text(admin_ops_uc)
     await message.answer(text, reply_markup=main_menu_reply_keyboard())
-    perf.mark("done")
 
 
 @router.message(F.text == BTN_ADDRESS, ~StateFilter(AdminStates))
@@ -327,7 +356,11 @@ async def client_inline_nav(
         perf.mark("after_set_state_choose_service")
         sent = await callback.message.answer(
             "Шаг 1/5 — выберите услугу",
-            reply_markup=service_keyboard(draft.draft_id, booking_uc.list_available_services()),
+            reply_markup=service_keyboard(
+                draft.draft_id,
+                booking_uc.list_available_services(),
+                getattr(booking_uc, "service_catalog_repo", None),
+            ),
         )
         perf.mark("after_answer_service_keyboard")
         await remember_booking_ui_message(state, sent)

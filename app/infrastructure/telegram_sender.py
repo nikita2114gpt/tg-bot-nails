@@ -1,3 +1,4 @@
+from app.application.service_catalog_view import format_service_block
 from app.domain.models import OutboxEvent
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from app.presentation.callback.reminder_callbacks import build_reminder_cancel, build_reminder_confirm
@@ -18,6 +19,8 @@ class TelegramSender:
         p = event.payload
         event_kind = str(p.get("event_kind") or "new_booking")
         service_id = p.get("service_id", "")
+        service_price_text = p.get("service_price_text")
+        service_duration_text = p.get("service_duration_text")
         start_datetime_utc = p.get("start_datetime_utc", "")
         customer_name = p.get("customer_name", "")
         phone_e164 = p.get("phone_e164", "")
@@ -30,13 +33,20 @@ class TelegramSender:
             "appointment_edited": "✏️ Запись отредактирована",
         }
         title = title_map.get(event_kind, "📌 Событие по записи")
-        text = (
-            f"{title}\n\n"
-            f"Услуга: {service_id}\n"
-            f"Дата/время: {_fmt_slot(start_datetime_utc)}\n"
-            f"Клиент: {customer_name}\n"
-            f"Телефон: {phone_e164}"
-        )
+        lines = [title, "", f"Дата/время: {_fmt_slot(start_datetime_utc)}"]
+        if isinstance(service_price_text, str) and service_price_text.strip():
+            lines.append(
+                format_service_block(
+                    service_id or "—",
+                    service_price_text.strip(),
+                    service_duration_text.strip() if isinstance(service_duration_text, str) else "—",
+                )
+            )
+        else:
+            lines.append(f"Услуга: {service_id}")
+        lines.append(f"Клиент: {customer_name}")
+        lines.append(f"Телефон: {phone_e164}")
+        text = "\n".join(lines)
 
         for admin_id in self.admin_ids:
             await self.bot.send_message(admin_id, text)

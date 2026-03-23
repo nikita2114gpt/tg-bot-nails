@@ -15,6 +15,7 @@ from app.application.validation import (
     validate_service_id,
     validate_time_string,
 )
+from app.application.service_catalog_view import resolve_service_price_and_duration_optional
 from app.domain.enums import AppointmentStatus, DraftStep, OutboxType
 from app.domain.models import Appointment, BookingDraft, OutboxEvent
 
@@ -520,6 +521,10 @@ class BookingUseCases:
 
     def _create_admin_notify_event_once(self, appointment: Appointment) -> OutboxEvent:
         key = f"admin_notify:{appointment.appointment_id}"
+        service_price_text, service_duration_text = resolve_service_price_and_duration_optional(
+            self.service_catalog_repo,
+            appointment.service_id,
+        )
 
         return create_outbox_once(
             idempotency_key=key,
@@ -534,6 +539,8 @@ class BookingUseCases:
                         "draft_id": appointment.draft_id,
                         "user_id": appointment.user_id,
                         "service_id": appointment.service_id,
+                        "service_price_text": service_price_text,
+                        "service_duration_text": service_duration_text,
                         "start_datetime_utc": appointment.start_datetime_utc,
                         "customer_name": appointment.customer_name,
                         "phone_e164": appointment.phone_e164,

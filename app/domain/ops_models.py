@@ -71,3 +71,14 @@ class SalonInfoSettings:
     show_address: bool = True
     show_contacts: bool = True
     updated_at: str = field(default_factory=_now_iso)
+
+
+@dataclass
+class PriceListItem:
+    """Отдельный от каталога услуг прайс для клиентского раздела «Прайс»."""
+
+    item_id: str = field(default_factory=_new_id)
+    display_text: str = ""
+    is_active: bool = True
+    created_at: str = field(default_factory=_now_iso)
+    updated_at: str = field(default_factory=_now_iso)

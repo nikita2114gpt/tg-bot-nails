@@ -14,6 +14,7 @@ from app.application.validation import (
     validate_time_string,
 )
 from app.application.idempotency import create_outbox_once
+from app.application.service_catalog_view import resolve_service_price_and_duration_optional
 from app.core.errors import ConflictError, NotFoundError, UserInputError
 from app.domain.enums import AppointmentStatus, OutboxType
 from app.domain.models import Appointment, OutboxEvent
@@ -40,11 +41,13 @@ class AppointmentUseCases:
         allowed_services: list[str],
         outbox_repo: object | None = None,
         lifecycle_repo: object | None = None,
+        service_catalog_repo: object | None = None,
     ) -> None:
         self.appointment_repo = appointment_repo
         self.allowed_services = allowed_services
         self.outbox_repo = outbox_repo
         self.lifecycle_repo = lifecycle_repo
+        self.service_catalog_repo = service_catalog_repo
 
     def _emit_admin_event_once(
         self,
@@ -55,6 +58,10 @@ class AppointmentUseCases:
     ) -> None:
         if self.outbox_repo is None:
             return
+        service_price_text, service_duration_text = resolve_service_price_and_duration_optional(
+            self.service_catalog_repo,
+            appointment.service_id,
+        )
         key = f"admin_event:{kind}:{appointment.appointment_id}"
         if dedupe_suffix:
             key = f"{key}:{dedupe_suffix}"
@@ -72,6 +79,8 @@ class AppointmentUseCases:
                         "draft_id": appointment.draft_id,
                         "user_id": appointment.user_id,
                         "service_id": appointment.service_id,
+                        "service_price_text": service_price_text,
+                        "service_duration_text": service_duration_text,
                         "start_datetime_utc": appointment.start_datetime_utc,
                         "customer_name": appointment.customer_name,
                         "phone_e164": appointment.phone_e164,

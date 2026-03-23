@@ -11,6 +11,7 @@ from app.domain.ops_models import (
     BlacklistEntry,
     ClientLifecycleMarker,
     DayScheduleOverride,
+    PriceListItem,
     SalonInfoSettings,
     ScheduleSettings,
     ServiceCatalogItem,
@@ -56,6 +57,7 @@ def _load_data():
                 "client_lifecycle_markers": [],
                 "day_schedule_overrides": [],
                 "salon_info_settings": {},
+                "price_list": [],
             }
 
         try:
@@ -86,6 +88,7 @@ def _load_data():
             "client_lifecycle_markers": _ensure_list(raw.get("client_lifecycle_markers")),
             "day_schedule_overrides": _ensure_list(raw.get("day_schedule_overrides")),
             "salon_info_settings": _safe_dict(raw.get("salon_info_settings")),
+            "price_list": _ensure_list(raw.get("price_list")),
         }
 
 
@@ -202,6 +205,33 @@ def _appointment_from_dict(data: dict) -> Optional[Appointment]:
         created_at=data.get("created_at") if isinstance(data.get("created_at"), str) else _now_iso(),
         updated_at=data.get("updated_at") if isinstance(data.get("updated_at"), str) else _now_iso(),
     )
+
+
+def _trim_cancelled_appointments_json(rows: list[Any]) -> list[Any]:
+    """Оставляем не более 500 отменённых записей (самые старые по created_at удаляются)."""
+    other: list[Any] = []
+    cancelled: list[dict] = []
+    for a in rows:
+        if not isinstance(a, dict):
+            continue
+        ap = _appointment_from_dict(a)
+        if ap is None:
+            continue
+        if ap.status == AppointmentStatus.CANCELLED:
+            cancelled.append(a)
+        else:
+            other.append(a)
+    if len(cancelled) <= 500:
+        return other + cancelled
+    cancelled.sort(
+        key=lambda d: (
+            (d.get("created_at") or "") if isinstance(d.get("created_at"), str) else "",
+            d.get("appointment_id") or "",
+        )
+    )
+    drop = len(cancelled) - 500
+    kept = cancelled[drop:]
+    return other + kept
 
 
 def _outbox_to_dict(event: OutboxEvent) -> dict:
@@ -330,6 +360,31 @@ def _service_item_from_dict(data: dict) -> Optional[ServiceCatalogItem]:
         name=str(data.get("name") or ""),
         duration_minutes=duration_minutes,
         price_text=str(data.get("price_text") or "—"),
+        is_active=bool(data.get("is_active", True)),
+        created_at=data.get("created_at") if isinstance(data.get("created_at"), str) else _now_iso(),
+        updated_at=data.get("updated_at") if isinstance(data.get("updated_at"), str) else _now_iso(),
+    )
+
+
+def _price_item_to_dict(item: PriceListItem) -> dict:
+    return {
+        "item_id": item.item_id,
+        "display_text": item.display_text,
+        "is_active": item.is_active,
+        "created_at": item.created_at,
+        "updated_at": item.updated_at,
+    }
+
+
+def _price_item_from_dict(data: dict) -> Optional[PriceListItem]:
+    if not isinstance(data, dict):
+        return None
+    item_id = data.get("item_id")
+    if not isinstance(item_id, str) or not item_id:
+        return None
+    return PriceListItem(
+        item_id=item_id,
+        display_text=str(data.get("display_text") or ""),
         is_active=bool(data.get("is_active", True)),
         created_at=data.get("created_at") if isinstance(data.get("created_at"), str) else _now_iso(),
         updated_at=data.get("updated_at") if isinstance(data.get("updated_at"), str) else _now_iso(),
@@ -537,7 +592,8 @@ class AppointmentRepository:
         items = [a for a in _ensure_list(data.get("appointments")) if isinstance(a, dict)]
         items = [a for a in items if a.get("appointment_id") != appointment.appointment_id]
         items.append(_appointment_to_dict(appointment))
-
+        if appointment.status == AppointmentStatus.CANCELLED:
+            items = _trim_cancelled_appointments_json(items)
         data["appointments"] = items
         _save_data(data)
 
@@ -807,6 +863,52 @@ class ServiceCatalogRepository:
         rows = [x for x in _ensure_list(data.get("service_catalog")) if isinstance(x, dict)]
         rows = [x for x in rows if x.get("service_id") != service_id]
         data["service_catalog"] = rows
+        _save_data(data)
+
+
+class PriceListRepository:
+    def list_all(self) -> list[PriceListItem]:
+        data = _load_data()
+        result: list[PriceListItem] = []
+        for row in _ensure_list(data.get("price_list")):
+            item = _price_item_from_dict(row) if isinstance(row, dict) else None
+            if item is not None:
+                result.append(item)
+        result.sort(key=lambda x: (x.created_at, x.item_id), reverse=True)
+        return result
+
+    def list_active(self) -> list[PriceListItem]:
+        data = _load_data()
+        result: list[PriceListItem] = []
+        for row in _ensure_list(data.get("price_list")):
+            item = _price_item_from_dict(row) if isinstance(row, dict) else None
+            if item is not None and item.is_active:
+                result.append(item)
+        result.sort(key=lambda x: (x.created_at, x.item_id))
+        return result
+
+    def get_by_id(self, item_id: str) -> Optional[PriceListItem]:
+        data = _load_data()
+        for row in _ensure_list(data.get("price_list")):
+            if not isinstance(row, dict):
+                continue
+            if row.get("item_id") == item_id:
+                return _price_item_from_dict(row)
+        return None
+
+    def save(self, item: PriceListItem) -> None:
+        data = _load_data()
+        rows = [x for x in _ensure_list(data.get("price_list")) if isinstance(x, dict)]
+        rows = [x for x in rows if x.get("item_id") != item.item_id]
+        rows.append(_price_item_to_dict(item))
+        data["price_list"] = rows
+        _save_data(data)
+
+    def delete(self, item_id: str) -> None:
+        data = _load_data()
+        rows = [x for x in _ensure_list(data.get("price_list")) if isinstance(x, dict)]
+        rows = [x for x in rows if x.get("item_id") != item_id]
+        data["price_list"] = rows
         _save_data(data)
 
 

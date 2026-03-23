@@ -17,6 +17,10 @@ from app.application.booking_uc import (
     BOOKING_SLOT_CONFLICT_MESSAGE,
     BookingUseCases,
 )
+from app.application.service_catalog_view import (
+    format_service_block,
+    resolve_service_price_and_duration,
+)
 from app.config import Settings
 from app.core.errors import AppError, ConflictError, error_to_user_message
 from app.domain.enums import AppointmentStatus, DraftStep
@@ -763,7 +767,11 @@ async def _recover_to_choose_date_from_stale(
         await _safe_edit_text(
             callback,
             "Выберите услугу:",
-            reply_markup=service_keyboard(draft_id, booking_uc.list_available_services()),
+            reply_markup=service_keyboard(
+                draft_id,
+                booking_uc.list_available_services(),
+                getattr(booking_uc, "service_catalog_repo", None),
+            ),
         )
         return
 
@@ -807,14 +815,44 @@ async def _confirm_failure_cleanup(
     await state.clear()
 
 
+def _resolve_service_price_text(
+    service_id: str,
+    booking_uc: BookingUseCases,
+    settings: Settings,
+) -> str:
+    price, _ = resolve_service_price_and_duration(
+        getattr(booking_uc, "service_catalog_repo", None),
+        service_id,
+    )
+    return price
+
+
+def _resolve_service_duration_text(
+    service_id: str,
+    booking_uc: BookingUseCases,
+    settings: Settings,
+) -> str:
+    _, duration = resolve_service_price_and_duration(
+        getattr(booking_uc, "service_catalog_repo", None),
+        service_id,
+    )
+    return duration
+
+
 async def _apply_confirm_success_ui(
     callback: CallbackQuery,
     state: FSMContext,
     ap,
+    booking_uc: BookingUseCases,
+    settings: Settings,
 ) -> None:
     await _clear_stale_contact_prompt_message(state, callback)
     await state.set_state(BookingStates.confirm_done)
-    success_body = _format_success_from_appointment(ap)
+    success_body = _format_success_from_appointment(
+        ap,
+        _resolve_service_price_text(str(ap.service_id or ""), booking_uc, settings),
+        _resolve_service_duration_text(str(ap.service_id or ""), booking_uc, settings),
+    )
     if callback.message is None:
         return
     deleted = False
@@ -963,7 +1001,7 @@ async def _present_admin_duplicate_active_booking(
         pass
 
 
-def _format_success_from_appointment(ap) -> str:
+def _format_success_from_appointment(ap, service_price_text: str, service_duration_text: str) -> str:
     """Формирует HTML-безопасный текст успешной записи из Appointment."""
     date_text = "—"
     time_text = "—"
@@ -974,16 +1012,22 @@ def _format_success_from_appointment(ap) -> str:
             date_text = f"{d[6:8]}.{d[4:6]}.{d[0:4]}"
         if len(t) >= 4 and t[:4].isdigit():
             time_text = f"{t[:2]}:{t[2:4]}"
+    service_block = format_service_block(
+        escape(str(ap.service_id or "—")),
+        escape(str(service_price_text or "—")),
+        escape(str(service_duration_text or "—")),
+    )
     return (
         "Запись подтверждена! 🎉\n\n"
         "Ждём вас:\n"
-        f"📅 {date_text}\n"
-        f"🕒 {time_text}\n"
-        f"💇 {escape(str(ap.service_id or '—'))}"
+        f"📅 Дата и время: {date_text} {time_text}\n"
+        f"{service_block}\n"
+        f"👤 Клиент: {escape(str(ap.customer_name or '—'))}\n"
+        f"📞 Телефон: {escape(str(ap.phone_e164 or '—'))}"
     )
 
 
-def _format_admin_created_card(ap) -> str:
+def _format_admin_created_card(ap, service_price_text: str, service_duration_text: str) -> str:
     date_text = "—"
     time_text = "—"
     s = ap.start_datetime_utc or ""
@@ -993,12 +1037,18 @@ def _format_admin_created_card(ap) -> str:
             date_text = f"{d[6:8]}.{d[4:6]}.{d[0:4]}"
         if len(t) >= 4 and t[:4].isdigit():
             time_text = f"{t[:2]}:{t[2:4]}"
+    service_block = format_service_block(
+        escape(str(ap.service_id or "—")),
+        escape(str(service_price_text or "—")),
+        escape(str(service_duration_text or "—")),
+    )
     return (
-        "Запись создана\n\n"
-        f"💅 {escape(str(ap.service_id or '—'))}\n"
-        f"📅 {date_text} • {time_text}\n"
-        f"👤 {escape(ap.customer_name or '—')}\n"
-        f"📱 {escape(ap.phone_e164 or '—')}\n"
+        "Запись подтверждена! 🎉\n\n"
+        "Ждём вас:\n"
+        f"📅 Дата и время: {date_text} {time_text}\n"
+        f"{service_block}\n"
+        f"👤 Клиент: {escape(ap.customer_name or '—')}\n"
+        f"📞 Телефон: {escape(ap.phone_e164 or '—')}\n"
         "🛠 Создано админом"
     )
 
@@ -1007,12 +1057,17 @@ async def _apply_admin_assisted_success_ui(
     callback: CallbackQuery,
     state: FSMContext,
     ap,
+    booking_uc: BookingUseCases,
 ) -> None:
     from app.presentation.keyboards.admin_reply_kb import admin_reply_keyboard
 
     await _clear_stale_contact_prompt_message(state, callback)
     await state.set_state(BookingStates.confirm_done)
-    body = _format_admin_created_card(ap)
+    body = _format_admin_created_card(
+        ap,
+        _resolve_service_price_text(str(ap.service_id or ""), booking_uc, None),
+        _resolve_service_duration_text(str(ap.service_id or ""), booking_uc, None),
+    )
     try:
         await _safe_edit_text(callback, body, reply_markup=None)
     except Exception:
@@ -1037,11 +1092,13 @@ async def _emit_booking_success_ui(
     state: FSMContext,
     ap,
     walk_in: bool,
+    booking_uc: BookingUseCases,
+    settings: Settings,
 ) -> None:
     if walk_in:
-        await _apply_admin_assisted_success_ui(callback, state, ap)
+        await _apply_admin_assisted_success_ui(callback, state, ap, booking_uc)
     else:
-        await _apply_confirm_success_ui(callback, state, ap)
+        await _apply_confirm_success_ui(callback, state, ap, booking_uc, settings)
 
 
 async def _handle_action_confirm(
@@ -1080,11 +1137,11 @@ async def _handle_action_confirm(
         ap_ready = _confirmed_for_draft()
         if ap_ready is not None:
             try:
-                await _emit_booking_success_ui(callback, state, ap_ready, walk_in)
+                await _emit_booking_success_ui(callback, state, ap_ready, walk_in, booking_uc, settings)
             except Exception:
                 ap2 = _confirmed_for_draft()
                 if ap2 is not None:
-                    await _emit_booking_success_ui(callback, state, ap2, walk_in)
+                    await _emit_booking_success_ui(callback, state, ap2, walk_in, booking_uc, settings)
                 else:
                     raise
             return
@@ -1099,11 +1156,11 @@ async def _handle_action_confirm(
             ap_recover = _confirmed_for_draft()
             if ap_recover is not None:
                 try:
-                    await _emit_booking_success_ui(callback, state, ap_recover, walk_in)
+                    await _emit_booking_success_ui(callback, state, ap_recover, walk_in, booking_uc, settings)
                 except Exception:
                     ap2 = _confirmed_for_draft()
                     if ap2 is not None:
-                        await _emit_booking_success_ui(callback, state, ap2, walk_in)
+                        await _emit_booking_success_ui(callback, state, ap2, walk_in, booking_uc, settings)
                     else:
                         raise
                 return
@@ -1127,11 +1184,11 @@ async def _handle_action_confirm(
             ap_recover = _confirmed_for_draft()
             if ap_recover is not None:
                 try:
-                    await _emit_booking_success_ui(callback, state, ap_recover, walk_in)
+                    await _emit_booking_success_ui(callback, state, ap_recover, walk_in, booking_uc, settings)
                 except Exception:
                     ap2 = _confirmed_for_draft()
                     if ap2 is not None:
-                        await _emit_booking_success_ui(callback, state, ap2, walk_in)
+                        await _emit_booking_success_ui(callback, state, ap2, walk_in, booking_uc, settings)
                     else:
                         raise
                 return
@@ -1139,11 +1196,11 @@ async def _handle_action_confirm(
             raise
 
         try:
-            await _emit_booking_success_ui(callback, state, appointment, walk_in)
+            await _emit_booking_success_ui(callback, state, appointment, walk_in, booking_uc, settings)
         except Exception:
             ap_recover = _confirmed_for_draft()
             if ap_recover is not None:
-                await _emit_booking_success_ui(callback, state, ap_recover, walk_in)
+                await _emit_booking_success_ui(callback, state, ap_recover, walk_in, booking_uc, settings)
                 return
             await _confirm_failure_cleanup(callback, state)
             raise
@@ -1153,7 +1210,7 @@ async def _handle_action_confirm(
         # Ошибки показа успеха не проглатываем — пробрасываем в callback_router.
         ap_fallback = _confirmed_for_draft()
         if ap_fallback is not None:
-            await _emit_booking_success_ui(callback, state, ap_fallback, walk_in)
+            await _emit_booking_success_ui(callback, state, ap_fallback, walk_in, booking_uc, settings)
             return
         await _confirm_failure_cleanup(callback, state)
         raise
@@ -1225,7 +1282,11 @@ async def _handle_action_back(
         await _safe_edit_text(
             callback,
             "Выберите услугу:",
-            reply_markup=service_keyboard(draft_id, booking_uc.list_available_services()),
+            reply_markup=service_keyboard(
+                draft_id,
+                booking_uc.list_available_services(),
+                getattr(booking_uc, "service_catalog_repo", None),
+            ),
         )
         return
 
@@ -1535,19 +1596,20 @@ async def contact_handler(
 
         await _clear_stale_contact_prompt_message(state, message)
         await _force_remove_contact_keyboard(message)
-        svc_line = (
-            f"💅 {escape(draft.service_id or '—')}"
-            if admin_assisted
-            else f"💇 {escape(draft.service_id or '—')}"
+        price_text, duration_text = resolve_service_price_and_duration(
+            getattr(booking_uc, "service_catalog_repo", None),
+            str(draft.service_id or ""),
         )
+        svc_line = f"💇 Услуга: {escape(draft.service_id or '—')}"
         phone_emoji = "📱" if admin_assisted else "📞"
         await message.answer(
             "Шаг 5/5 - проверьте запись ✅\n\n"
+            f"📅 Дата и время: {date_text} {time_text}\n"
             f"{svc_line}\n"
-            f"📅 {date_text}\n"
-            f"🕒 {time_text}\n\n"
-            f"👤 {escape(draft.customer_name or '—')}\n"
-            f"{phone_emoji} {escape(draft.phone_e164 or '—')}",
+            f"💰 Цена: {escape(price_text or '—')}\n"
+            f"⏱ Длительность: {escape(duration_text or '—')}\n"
+            f"👤 Клиент: {escape(draft.customer_name or '—')}\n"
+            f"{phone_emoji} Телефон: {escape(draft.phone_e164 or '—')}",
             reply_markup=confirm_keyboard(draft.draft_id),
         )
 
