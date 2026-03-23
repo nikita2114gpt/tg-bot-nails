@@ -2,16 +2,18 @@
 Description=Telegram bot (aiogram)
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
 
 [Service]
 Type=simple
-User=www-data
-Group=www-data
-WorkingDirectory=/opt/tgbot2
+User=root
+WorkingDirectory=/opt/tgbot/bot
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/opt/tgbot2/.venv/bin/python -m app.main
+ExecStart=/opt/tgbot/bot/.venv/bin/python -m app.main
 Restart=always
 RestartSec=5
+TimeoutStartSec=60
 KillSignal=SIGINT
 TimeoutStopSec=30
 
