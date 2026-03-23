@@ -1,5 +1,6 @@
 import asyncio
 import os
+import sqlite3
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher
@@ -11,6 +12,7 @@ from app.application.appointment_uc import AppointmentUseCases
 from app.application.admin_ops_uc import AdminOpsUseCases
 from app.application.booking_uc import BookingUseCases
 from app.config import load_settings
+from app.infrastructure.logging import configure_logging, get_logger
 from app.infrastructure.outbox_worker import OutboxWorker
 from app.infrastructure.storage_filejson import (
     AppointmentRepository,
@@ -43,26 +45,56 @@ from app.presentation.handlers.client_menu_handlers import router as client_menu
 from app.presentation.handlers.common_handlers import router as common_router
 from app.presentation.handlers.reminder_handlers import router as reminder_router
 
+logger = get_logger(__name__)
+
+
+def _preflight_checks() -> None:
+    logger.info("startup-check: validate environment")
+    raw_token = (os.getenv("BOT_TOKEN") or "").strip()
+    if not raw_token:
+        raise RuntimeError("startup-check failed: BOT_TOKEN is empty or missing")
+
+    raw_admin_ids = (os.getenv("ADMIN_IDS") or "").strip()
+    if not raw_admin_ids:
+        raise RuntimeError("startup-check failed: ADMIN_IDS is empty or missing")
+
+    storage_backend = (os.getenv("BOT_STORAGE_BACKEND", "json") or "json").lower().strip()
+    if storage_backend != "sqlite":
+        logger.info("startup-check: sqlite probe skipped (backend=%s)", storage_backend)
+        return
+
+    base_dir = Path(__file__).resolve().parents[1]
+    sqlite_db_path = os.getenv(
+        "SQLITE_DB_PATH",
+        str(base_dir / "data" / "bot2.sqlite3"),
+    )
+    db_path = Path(sqlite_db_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(str(db_path), timeout=10) as conn:
+        conn.execute("SELECT 1;")
+    logger.info("startup-check: sqlite is reachable (%s)", db_path)
+
 
 async def main():
-    print("init: load settings", flush=True)
+    logger.info("init: load settings")
     settings = load_settings()
+    if not settings.admin_ids:
+        raise RuntimeError("startup-check failed: ADMIN_IDS parsed to empty list")
     if settings.allow_multiple_active_bookings:
-        print(
-            "init: test mode — ALLOW_MULTIPLE_ACTIVE_BOOKINGS: несколько активных записей на пользователя",
-            flush=True,
+        logger.warning(
+            "init: test mode enabled (ALLOW_MULTIPLE_ACTIVE_BOOKINGS=true)"
         )
 
-    print("init: create bot", flush=True)
+    logger.info("init: create bot")
     bot = Bot(
         token=settings.bot_token,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
 
-    print("init: create dispatcher", flush=True)
+    logger.info("init: create dispatcher")
     dp = Dispatcher()
 
-    print("init: create repositories", flush=True)
+    logger.info("init: create repositories")
     base_dir = Path(__file__).resolve().parents[1]
     storage_backend = (os.getenv("BOT_STORAGE_BACKEND", "json") or "json").lower().strip()
     sqlite_db_path = os.getenv(
@@ -82,7 +114,7 @@ async def main():
             lifecycle_repo = SqliteClientLifecycleMarkerRepository(db_path=sqlite_db_path)
             salon_info_repo = SqliteSalonInfoSettingsRepository(db_path=sqlite_db_path)
             price_list_repo = SqlitePriceListRepository(db_path=sqlite_db_path)
-            print("init: storage backend = sqlite", flush=True)
+            logger.info("init: storage backend = sqlite")
 
             # One-time migration for legacy JSON storage.
             try:
@@ -96,13 +128,13 @@ async def main():
                 )
             except Exception as e:
                 # Не падаем, если JSON битый/отсутствует.
-                print(
-                    f"init: json->sqlite migration failed, continue. error={e}",
-                    flush=True,
+                logger.exception(
+                    "init: json->sqlite migration failed, continue. error=%s",
+                    e,
                 )
         except Exception as e:
             # Фоллбэк на legacy JSON, чтобы не ломать рабочий сценарий.
-            print(f"init: sqlite init failed, fallback to json. error={e}", flush=True)
+            logger.exception("init: sqlite init failed, fallback to json. error=%s", e)
             draft_repo = DraftRepository()
             appointment_repo = AppointmentRepository()
             outbox_repo = OutboxRepository()
@@ -125,7 +157,7 @@ async def main():
         salon_info_repo = SalonInfoSettingsRepository()
         price_list_repo = PriceListRepository()
 
-    print("init: create booking use-cases", flush=True)
+    logger.info("init: create booking use-cases")
     booking_uc = BookingUseCases(
         draft_repo=draft_repo,
         appointment_repo=appointment_repo,
@@ -153,13 +185,13 @@ async def main():
         price_list_repo=price_list_repo,
     )
 
-    print("init: create telegram sender", flush=True)
+    logger.info("init: create telegram sender")
     sender = TelegramSender(
         bot=bot,
         admin_ids=settings.admin_ids,
     )
 
-    print("init: create outbox worker", flush=True)
+    logger.info("init: create outbox worker")
     worker = OutboxWorker(
         outbox_repo=outbox_repo,
         sender=sender,
@@ -168,7 +200,7 @@ async def main():
         appointment_repo=appointment_repo,
     )
 
-    print("init: include routers", flush=True)
+    logger.info("init: include routers")
     dp.include_router(common_router)
     dp.include_router(client_menu_router)
     dp.include_router(booking_router)
@@ -177,25 +209,24 @@ async def main():
 
     worker_task: asyncio.Task | None = None
 
-    print("init: bot get_me", flush=True)
+    logger.info("init: bot get_me")
     try:
         me = await asyncio.wait_for(bot.get_me(), timeout=10)
     except (TelegramNetworkError, asyncio.TimeoutError, OSError):
-        print(
+        logger.error(
             "Ошибка: не удалось подключиться к Telegram (таймаут get_me). "
             "Проверьте интернет и доступность api.telegram.org.",
-            flush=True,
         )
         await bot.session.close()
         return
 
     username = getattr(me, "username", None)
-    print(f"bot started: @{username}" if username else "bot started (no username)", flush=True)
+    logger.info("bot started: @%s", username if username else "unknown")
 
     worker_task = asyncio.create_task(worker.start())
 
     try:
-        print("init: start polling", flush=True)
+        logger.info("start polling")
         try:
             await dp.start_polling(
                 bot,
@@ -211,17 +242,19 @@ async def main():
         except TelegramConflictError as e:
             # Типовая ситуация, когда запущено более одного экземпляра бота
             # (aiogram при getUpdates/long polling получает Conflict).
-            print(
+            logger.error(
                 f"TelegramConflictError: конфликт getUpdates. "
                 f"Убедись, что запущен только один инстанс бота. details={e}",
-                flush=True,
             )
             return
         except KeyboardInterrupt:
-            print("KeyboardInterrupt: shutdown requested", flush=True)
+            logger.info("shutdown: keyboard interrupt requested")
             return
+        except Exception:
+            logger.exception("polling crashed with unhandled exception")
+            raise
     finally:
-        print("shutdown: stopping worker", flush=True)
+        logger.info("shutdown: stopping worker")
         worker.stop()
         if worker_task is not None and not worker_task.done():
             worker_task.cancel()
@@ -230,8 +263,17 @@ async def main():
             except asyncio.CancelledError:
                 pass
 
+        logger.info("shutdown: closing bot session")
         await bot.session.close()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    configure_logging()
+    try:
+        _preflight_checks()
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("shutdown: interrupted by user")
+    except Exception:
+        logger.exception("fatal: bot process terminated by unhandled exception")
+        raise SystemExit(1)

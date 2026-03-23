@@ -5,6 +5,9 @@ from datetime import datetime, timedelta
 from app.domain.enums import AppointmentStatus, OutboxType
 from app.domain.models import OutboxEvent
 from app.domain.ops_models import ClientLifecycleMarker
+from app.infrastructure.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class OutboxWorker:
@@ -25,13 +28,22 @@ class OutboxWorker:
 
     async def start(self):
         self._running = True
+        logger.info("outbox-worker: started (interval=%ss)", self.interval_seconds)
 
         while self._running:
-            await self._process_once()
+            try:
+                await self._process_once()
+            except asyncio.CancelledError:
+                logger.info("outbox-worker: cancelled")
+                raise
+            except Exception:
+                logger.exception("outbox-worker: unhandled loop error")
+
             await asyncio.sleep(self.interval_seconds)
 
     def stop(self):
         self._running = False
+        logger.info("outbox-worker: stop requested")
 
     def _delivery_allowed_for_reminder_client(self, event: OutboxEvent) -> bool:
         """
@@ -93,6 +105,11 @@ class OutboxWorker:
 
             except Exception as e:
                 self.outbox_repo.mark_failed(event.event_id, str(e))
+                logger.exception(
+                    "outbox-worker: failed event_id=%s type=%s",
+                    event.event_id,
+                    getattr(event.event_type, "value", event.event_type),
+                )
 
     def _handle_no_confirm_alert(self, event: OutboxEvent) -> None:
         p = event.payload

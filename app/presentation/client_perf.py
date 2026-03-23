@@ -5,6 +5,10 @@ from __future__ import annotations
 import os
 import time
 
+from app.infrastructure.logging import get_logger
+
+logger = get_logger(__name__)
+
 
 def is_client_perf_enabled() -> bool:
     v = (os.getenv("BOT_CLIENT_PERF_LOG") or "").strip().lower()
@@ -29,7 +33,10 @@ class PerfSpan:
         delta_ms = (now - self._last) * 1000
         total_ms = (now - self._start) * 1000
         self._last = now
-        print(
-            f"PERF [{self._flow}] {phase}  +{delta_ms:.1f}ms  (total {total_ms:.1f}ms)",
-            flush=True,
+        logger.info(
+            "PERF [%s] %s  +%.1fms  (total %.1fms)",
+            self._flow,
+            phase,
+            delta_ms,
+            total_ms,
         )

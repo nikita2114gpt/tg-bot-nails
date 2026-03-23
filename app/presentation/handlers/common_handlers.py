@@ -1,16 +1,17 @@
 from __future__ import annotations
 
-import logging
 import traceback
 
 from aiogram import Router
 from aiogram.filters import Command, StateFilter
 from aiogram.types import Message
 
+from app.infrastructure.logging import get_logger
 from app.presentation.fsm.states import AdminStates
 from aiogram.types.error_event import ErrorEvent
 
 router = Router(name="common")
+logger = get_logger(__name__)
 
 
 @router.message(Command("help"), ~StateFilter(AdminStates))
@@ -47,7 +48,7 @@ async def on_error(event: ErrorEvent, bot: object | None = None) -> None:  # bot
         )
     except Exception:
         tb = f"{type(event.exception).__name__}: {err_text}"
-    _log.error("handler error:\n%s", tb.rstrip())
+    logger.exception("handler error: %s\n%s", err_text, tb.rstrip())
 
     text = "Произошла ошибка при выполнении команды. Попробуйте ещё раз."
 

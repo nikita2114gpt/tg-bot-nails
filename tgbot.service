@@ -1,0 +1,19 @@
+[Unit]
+Description=Telegram bot (aiogram)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/tgbot2
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/tgbot2/.venv/bin/python -m app.main
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

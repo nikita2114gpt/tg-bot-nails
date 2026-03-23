@@ -6,11 +6,14 @@ from typing import Any, Optional
 
 from app.domain.enums import AppointmentStatus, DraftStep, OutboxStatus, OutboxType
 from app.domain.models import Appointment, BookingDraft, OutboxEvent
+from app.infrastructure.logging import get_logger
 from app.infrastructure.storage_sqlite import (
     AppointmentRepository,
     DraftRepository,
     OutboxRepository,
 )
+
+logger = get_logger(__name__)
 
 
 def _now_iso() -> str:
@@ -34,10 +37,9 @@ def _safe_load_json(storage_json_path: Path) -> tuple[dict[str, Any], bool]:
         with storage_json_path.open("r", encoding="utf-8") as f:
             raw = json.load(f)
     except json.JSONDecodeError:
-        print(
+        logger.warning(
             f"init: json->sqlite migration: JSONDecodeError for {storage_json_path}. "
             f"Backing up and continuing with empty storage.",
-            flush=True,
         )
         backup_name = (
             f"{storage_json_path.name}.bak.{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}"
@@ -171,17 +173,15 @@ def migrate_json_to_sqlite(json_path: str | Path, db_path: str | Path) -> None:
             draft_repo.save_draft(draft)
         except sqlite3.IntegrityError as e:
             had_errors = True
-            print(
+            logger.warning(
                 f"init: json->sqlite migration: failed to save draft_id={draft_id}. "
                 f"error={e}",
-                flush=True,
             )
         except Exception as e:
             had_errors = True
-            print(
+            logger.exception(
                 f"init: json->sqlite migration: unexpected error saving draft_id={draft_id}. "
                 f"error={e}",
-                flush=True,
             )
 
     # 5) Мигрируем appointments.
@@ -227,17 +227,15 @@ def migrate_json_to_sqlite(json_path: str | Path, db_path: str | Path) -> None:
             appointment_repo.save_appointment(ap)
         except sqlite3.IntegrityError as e:
             had_errors = True
-            print(
+            logger.warning(
                 f"init: json->sqlite migration: failed to save appointment_id={appointment_id}. "
                 f"error={e}",
-                flush=True,
             )
         except Exception as e:
             had_errors = True
-            print(
+            logger.exception(
                 f"init: json->sqlite migration: unexpected error saving appointment_id={appointment_id}. "
                 f"error={e}",
-                flush=True,
             )
 
     # 6) Мигрируем outbox.
@@ -300,17 +298,15 @@ def migrate_json_to_sqlite(json_path: str | Path, db_path: str | Path) -> None:
             outbox_repo.save_event(ev)
         except sqlite3.IntegrityError as e:
             had_errors = True
-            print(
+            logger.warning(
                 f"init: json->sqlite migration: failed to save outbox event_id={event_id} key={idempotency_key}. "
                 f"error={e}",
-                flush=True,
             )
         except Exception as e:
             had_errors = True
-            print(
+            logger.exception(
                 f"init: json->sqlite migration: unexpected error saving outbox event_id={event_id} key={idempotency_key}. "
                 f"error={e}",
-                flush=True,
             )
 
     # 6.5) Прайс (отдельная таблица; читаем полный JSON).
@@ -348,22 +344,19 @@ def migrate_json_to_sqlite(json_path: str | Path, db_path: str | Path) -> None:
             price_repo.save(item)
         except sqlite3.IntegrityError as e:
             had_errors = True
-            print(
+            logger.warning(
                 f"init: json->sqlite migration: failed price_list item_id={item_id}. error={e}",
-                flush=True,
             )
         except Exception as e:
             had_errors = True
-            print(
+            logger.exception(
                 f"init: json->sqlite migration: unexpected error price_list item_id={item_id}. error={e}",
-                flush=True,
             )
 
     # 7) Ставим маркер только если не было ошибок сохранения.
     if had_errors:
-        print(
+        logger.warning(
             "init: json->sqlite migration: finished with errors; marker not set to allow retry.",
-            flush=True,
         )
         return
 
