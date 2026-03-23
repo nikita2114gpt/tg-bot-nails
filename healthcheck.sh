@@ -3,6 +3,7 @@ set -e
 
 PROJECT_DIR="/opt/tgbot/bot"
 ENV_FILE="${PROJECT_DIR}/.env"
+critical_fail=0
 
 echo "=== systemd status ==="
 systemctl status tgbot --no-pager || true
@@ -17,6 +18,7 @@ if [ -f "${ENV_FILE}" ]; then
   echo "OK: ${ENV_FILE} exists"
 else
   echo "ERROR: ${ENV_FILE} is missing"
+  critical_fail=1
 fi
 
 echo
@@ -38,6 +40,7 @@ if [ -f "${ENV_FILE}" ]; then
       echo "OK: sqlite DB exists: ${resolved_db_path}"
     else
       echo "ERROR: sqlite DB missing: ${resolved_db_path}"
+      critical_fail=1
     fi
   else
     echo "SKIP: backend is not sqlite (BOT_STORAGE_BACKEND=${backend:-unset})"
@@ -53,12 +56,13 @@ if ps aux | grep -q '[p]ython.*-m app.main'; then
   ps aux | grep '[p]ython.*-m app.main'
 else
   echo "ERROR: bot process is not running"
+  critical_fail=1
 fi
 
 echo
 echo "=== bot ping (getMe) ==="
 if [ -x "${PROJECT_DIR}/.venv/bin/python" ] && [ -f "${ENV_FILE}" ]; then
-  "${PROJECT_DIR}/.venv/bin/python" - << 'PY'
+  if ! "${PROJECT_DIR}/.venv/bin/python" - << 'PY'
 import os
 import urllib.request
 import urllib.error
@@ -76,7 +80,7 @@ except Exception:
 
 if not token:
     print("ERROR: BOT_TOKEN missing in .env")
-    raise SystemExit(0)
+    raise SystemExit(1)
 
 url = f"https://api.telegram.org/bot{token}/getMe"
 try:
@@ -84,13 +88,29 @@ try:
         payload = response.read().decode("utf-8", errors="ignore")
         if '"ok":true' in payload:
             print("OK: bot ping successful")
+            raise SystemExit(0)
         else:
             print("ERROR: bot ping failed")
+            raise SystemExit(1)
 except urllib.error.URLError as exc:
     print(f"ERROR: bot ping request failed: {exc}")
+    raise SystemExit(1)
 except Exception as exc:
     print(f"ERROR: bot ping unexpected failure: {exc}")
+    raise SystemExit(1)
 PY
+  then
+    critical_fail=1
+  fi
 else
   echo "ERROR: .venv python or .env missing, ping skipped"
+  critical_fail=1
 fi
+
+echo
+if [ "${critical_fail}" -eq 0 ]; then
+  echo "HEALTHCHECK RESULT: OK"
+  exit 0
+fi
+echo "HEALTHCHECK RESULT: CRITICAL FAIL"
+exit 1

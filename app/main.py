@@ -14,6 +14,7 @@ from app.application.booking_uc import BookingUseCases
 from app.config import load_settings
 from app.infrastructure.logging import attach_telegram_alerts, configure_logging, get_logger
 from app.infrastructure.outbox_worker import OutboxWorker
+from app.infrastructure.runtime_lock import RuntimeLock, RuntimeLockError
 from app.infrastructure.storage_filejson import (
     AppointmentRepository,
     BlacklistRepository,
@@ -46,6 +47,7 @@ from app.presentation.handlers.common_handlers import router as common_router
 from app.presentation.handlers.reminder_handlers import router as reminder_router
 
 logger = get_logger(__name__)
+runtime_lock: RuntimeLock | None = None
 
 
 def _resolve_storage() -> tuple[str, str]:
@@ -259,11 +261,10 @@ async def _run_once() -> None:
                 close_bot_session=False,
             )
         except TelegramConflictError as e:
-            # Типовая ситуация, когда запущено более одного экземпляра бота
-            # (aiogram при getUpdates/long polling получает Conflict).
-            logger.exception(
-                f"TelegramConflictError: конфликт getUpdates. "
-                f"Убедись, что запущен только один инстанс бота. details={e}",
+            logger.critical(
+                "operational.telegram_conflict: getUpdates conflict (details=%s)",
+                e,
+                exc_info=True,
             )
             raise
         except KeyboardInterrupt:
@@ -295,10 +296,29 @@ async def _run_once() -> None:
 if __name__ == "__main__":
     configure_logging()
     try:
+        lock_path = os.getenv("BOT_RUNTIME_LOCK_FILE", "/tmp/tgbot.lock")
+        runtime_lock = RuntimeLock(lock_file=lock_path)
+        runtime_lock.acquire()
         _preflight_checks()
         asyncio.run(_run_once())
+    except RuntimeLockError as e:
+        logger.critical(
+            "operational.single_instance_violation: %s. stop process (systemd restart policy only)",
+            e,
+        )
+        raise SystemExit(1)
+    except TelegramConflictError:
+        logger.critical(
+            "operational.telegram_conflict: duplicate polling detected. "
+            "stop process to let systemd control restart",
+            exc_info=True,
+        )
+        raise SystemExit(1)
     except KeyboardInterrupt:
         logger.info("shutdown: interrupted by user")
     except Exception:
         logger.exception("fatal: bot process terminated by unhandled exception")
         raise SystemExit(1)
+    finally:
+        if runtime_lock is not None:
+            runtime_lock.release()
