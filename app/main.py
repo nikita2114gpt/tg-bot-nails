@@ -1,18 +1,20 @@
 import asyncio
 import os
 import sqlite3
+import time
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramConflictError, TelegramNetworkError
+from aiogram.exceptions import TelegramConflictError
 
 from app.application.appointment_uc import AppointmentUseCases
 from app.application.admin_ops_uc import AdminOpsUseCases
 from app.application.booking_uc import BookingUseCases
 from app.config import load_settings
 from app.infrastructure.logging import attach_telegram_alerts, configure_logging, get_logger
+from app.infrastructure.network_retry import retry_network_operation
 from app.infrastructure.outbox_worker import OutboxWorker
 from app.infrastructure.runtime_lock import RuntimeLock, RuntimeLockError
 from app.infrastructure.storage_filejson import (
@@ -230,15 +232,18 @@ async def _run_once() -> None:
     watchdog_task: asyncio.Task | None = None
 
     logger.info("init: bot get_me")
-    try:
-        me = await asyncio.wait_for(bot.get_me(), timeout=10)
-    except (TelegramNetworkError, asyncio.TimeoutError, OSError):
+
+    async def _get_me() -> object:
+        return await asyncio.wait_for(bot.get_me(), timeout=10)
+
+    me = await retry_network_operation(_get_me, operation_name="startup_get_me")
+    if me is None:
         logger.error(
             "Ошибка: не удалось подключиться к Telegram (таймаут get_me). "
             "Проверьте интернет и доступность api.telegram.org.",
         )
         await bot.session.close()
-        return
+        raise RuntimeError("startup get_me failed after retries")
 
     username = getattr(me, "username", None)
     logger.info("bot started: @%s", username if username else "unknown")
@@ -295,30 +300,32 @@ async def _run_once() -> None:
 
 if __name__ == "__main__":
     configure_logging()
-    try:
-        lock_path = os.getenv("BOT_RUNTIME_LOCK_FILE", "/tmp/tgbot.lock")
-        runtime_lock = RuntimeLock(lock_file=lock_path)
-        runtime_lock.acquire()
-        _preflight_checks()
-        asyncio.run(_run_once())
-    except RuntimeLockError as e:
-        logger.critical(
-            "operational.single_instance_violation: %s. stop process (systemd restart policy only)",
-            e,
-        )
-        raise SystemExit(1)
-    except TelegramConflictError:
-        logger.critical(
-            "operational.telegram_conflict: duplicate polling detected. "
-            "stop process to let systemd control restart",
-            exc_info=True,
-        )
-        raise SystemExit(1)
-    except KeyboardInterrupt:
-        logger.info("shutdown: interrupted by user")
-    except Exception:
-        logger.exception("fatal: bot process terminated by unhandled exception")
-        raise SystemExit(1)
-    finally:
-        if runtime_lock is not None:
-            runtime_lock.release()
+    while True:
+        try:
+            lock_path = os.getenv("BOT_RUNTIME_LOCK_FILE", "/tmp/tgbot.lock")
+            runtime_lock = RuntimeLock(lock_file=lock_path)
+            runtime_lock.acquire()
+            _preflight_checks()
+            asyncio.run(_run_once())
+            logger.warning("polling exited unexpectedly; restart in 5 seconds")
+        except RuntimeLockError as e:
+            logger.critical(
+                "operational.single_instance_violation: %s. stop process (systemd restart policy only)",
+                e,
+            )
+            raise SystemExit(1)
+        except KeyboardInterrupt:
+            logger.info("shutdown: interrupted by user")
+            break
+        except TelegramConflictError:
+            logger.exception(
+                "operational.telegram_conflict: duplicate polling detected; retry in 5 seconds",
+            )
+        except Exception:
+            logger.exception("fatal: polling crashed; retry in 5 seconds")
+        finally:
+            if runtime_lock is not None:
+                runtime_lock.release()
+                runtime_lock = None
+
+        time.sleep(5)

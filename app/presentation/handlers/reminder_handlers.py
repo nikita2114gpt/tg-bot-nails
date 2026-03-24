@@ -10,16 +10,14 @@ from app.core.errors import AppError, error_to_user_message
 from app.domain.enums import AppointmentStatus, OutboxType
 from app.domain.models import OutboxEvent
 from app.domain.ops_models import ClientLifecycleMarker
+from app.infrastructure.safe_telegram import safe_answer_callback
 from app.presentation.callback.reminder_callbacks import parse_reminder_callback
 
 router = Router(name="reminder_callbacks")
 
 
 async def _safe_answer(callback: CallbackQuery, text: str) -> None:
-    try:
-        await callback.answer(text, show_alert=False, cache_time=0)
-    except Exception:
-        pass
+    await safe_answer_callback(callback, text, show_alert=False, cache_time=0)
 
 
 @router.callback_query(F.data.startswith("r1|"))

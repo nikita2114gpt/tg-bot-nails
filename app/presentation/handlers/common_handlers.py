@@ -48,11 +48,42 @@ async def on_error(event: ErrorEvent, bot: object | None = None) -> None:  # bot
         )
     except Exception:
         tb = f"{type(event.exception).__name__}: {err_text}"
-    logger.exception("handler error: %s\n%s", err_text, tb.rstrip())
+    update = event.update
+    user_id: int | None = None
+    handler_name = "unknown"
+    payload = ""
+    try:
+        if getattr(update, "message", None) and getattr(update.message, "from_user", None):
+            user_id = update.message.from_user.id
+            payload = update.message.text or ""
+        elif getattr(update, "callback_query", None):
+            cq = update.callback_query
+            if getattr(cq, "from_user", None):
+                user_id = cq.from_user.id
+            payload = cq.data or ""
+    except Exception:
+        pass
+
+    try:
+        extra_data = getattr(event, "extra_data", {}) or {}
+        handler_candidate = extra_data.get("handler")
+        if handler_candidate is not None:
+            handler_name = str(handler_candidate)
+    except Exception:
+        pass
+
+    logger.exception(
+        "GLOBAL_HANDLER_ERROR type=%s handler=%s user_id=%s payload=%s error=%s\n%s",
+        type(event.exception).__name__,
+        handler_name,
+        user_id,
+        payload,
+        err_text,
+        tb.rstrip(),
+    )
 
     text = "Произошла ошибка при выполнении команды. Попробуйте ещё раз."
 
-    update = event.update
     # Best-effort attempt to reply to the user.
     if getattr(update, "message", None):
         await update.message.answer(text)
