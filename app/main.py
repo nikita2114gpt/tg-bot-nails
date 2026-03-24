@@ -300,32 +300,29 @@ async def _run_once() -> None:
 
 if __name__ == "__main__":
     configure_logging()
-    while True:
-        try:
-            lock_path = os.getenv("BOT_RUNTIME_LOCK_FILE", "/tmp/tgbot.lock")
-            runtime_lock = RuntimeLock(lock_file=lock_path)
-            runtime_lock.acquire()
-            _preflight_checks()
-            asyncio.run(_run_once())
-            logger.warning("polling exited unexpectedly; restart in 5 seconds")
-        except RuntimeLockError as e:
-            logger.critical(
-                "operational.single_instance_violation: %s. stop process (systemd restart policy only)",
-                e,
-            )
-            raise SystemExit(1)
-        except KeyboardInterrupt:
-            logger.info("shutdown: interrupted by user")
-            break
-        except TelegramConflictError:
-            logger.exception(
-                "operational.telegram_conflict: duplicate polling detected; retry in 5 seconds",
-            )
-        except Exception:
-            logger.exception("fatal: polling crashed; retry in 5 seconds")
-        finally:
-            if runtime_lock is not None:
-                runtime_lock.release()
-                runtime_lock = None
-
-        time.sleep(5)
+    try:
+        lock_path = os.getenv("BOT_RUNTIME_LOCK_FILE", "/tmp/tgbot.lock")
+        runtime_lock = RuntimeLock(lock_file=lock_path)
+        runtime_lock.acquire()
+        _preflight_checks()
+        asyncio.run(_run_once())
+    except RuntimeLockError as e:
+        logger.critical(
+            "operational.single_instance_violation: %s. stop process (systemd restart policy only)",
+            e,
+        )
+        raise SystemExit(1)
+    except KeyboardInterrupt:
+        logger.info("shutdown: interrupted by user")
+    except TelegramConflictError:
+        logger.exception(
+            "operational.telegram_conflict: duplicate polling detected. "
+            "stop process to let systemd control restart",
+        )
+        raise SystemExit(1)
+    except Exception:
+        logger.exception("fatal: bot process terminated by unhandled exception")
+        raise SystemExit(1)
+    finally:
+        if runtime_lock is not None:
+            runtime_lock.release()
