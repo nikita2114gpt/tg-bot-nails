@@ -36,7 +36,8 @@ from app.presentation.callback.nav_callbacks import (
     build_admin_set_date,
     build_admin_set_service,
     build_admin_set_time,
-    build_admin_time_slot,
+    build_admin_slot_open,
+    build_admin_slot_toggle,
     build_admin_cancelled,
     build_admin_ops_blacklist,
     build_admin_ops_blacklist_add,
@@ -300,11 +301,50 @@ def _slot_is_occupied_for_items(
     items: list[Appointment],
     admin_ops_uc: AdminOpsUseCases,
     hhmm: str,
+    date_yyyymmdd: str | None = None,
     exclude_appointment_id: str | None = None,
+    requested_service_id: str | None = None,
+    workday_end_hhmm: str | None = None,
 ) -> Appointment | None:
     slot_min = _hhmm_to_minutes(hhmm)
     if slot_min is None:
         return None
+    workday_end_min = _hhmm_to_minutes(workday_end_hhmm) if workday_end_hhmm else None
+    if requested_service_id:
+        try:
+            requested_duration_min = max(
+                int(admin_ops_uc.get_service_slot_step_minutes(requested_service_id)),
+                5,
+            )
+        except Exception:
+            requested_duration_min = 60
+        try:
+            if date_yyyymmdd and admin_ops_uc.is_service_interval_blocked_by_disabled_slots(
+                date_yyyymmdd,
+                hhmm,
+                requested_duration_min,
+            ):
+                return Appointment(
+                    appointment_id="__disabled_slot_block__",
+                    draft_id="",
+                    user_id=0,
+                    service_id=requested_service_id,
+                    start_datetime_utc="",
+                    customer_name="",
+                    phone_e164="",
+                )
+        except Exception:
+            pass
+        if workday_end_min is not None and (slot_min + requested_duration_min) > workday_end_min:
+            return Appointment(
+                appointment_id="__workday_end_block__",
+                draft_id="",
+                user_id=0,
+                service_id=requested_service_id,
+                start_datetime_utc="",
+                customer_name="",
+                phone_e164="",
+            )
     for ap in items:
         if ap.status == AppointmentStatus.CANCELLED:
             continue
@@ -322,7 +362,16 @@ def _slot_is_occupied_for_items(
         except Exception:
             duration_min = 60
         end_min = start_min + duration_min
-        if start_min <= slot_min < end_min:
+        try:
+            requested_duration_for_overlap = max(
+                int(admin_ops_uc.get_service_slot_step_minutes(requested_service_id or ap.service_id)),
+                5,
+            )
+        except Exception:
+            requested_duration_for_overlap = 60
+        new_start = slot_min
+        new_end = slot_min + requested_duration_for_overlap
+        if not (new_end <= start_min or new_start >= end_min):
             return ap
     return None
 
@@ -332,7 +381,8 @@ def _schedule_text(value: ScheduleSettings) -> str:
         "<b>Управление расписанием ✨</b>\n"
         "Настройки ниже.\n\n"
         f"Начало дня: {_fmt_hhmm(value.open_time_hhmm)}\n"
-        f"Конец дня: {_fmt_hhmm(value.close_time_hhmm)}\n"
+        f"Последний слот: {_fmt_hhmm(value.close_time_hhmm)}\n"
+        f"Конец рабочего дня: {_fmt_hhmm(value.workday_end_time_hhmm)}\n"
         f"Шаг слотов: {_fmt_duration_minutes(value.slot_minutes)}"
     )
 
@@ -573,16 +623,27 @@ async def admin_callback(
 
     def _is_short_day(ymd: str) -> bool:
         try:
-            ov = admin_ops_uc.get_day_override(ymd)
+            if admin_ops_uc.is_day_closed(ymd):
+                return False
         except Exception:
             return False
-        if ov is None or bool(getattr(ov, "is_closed", False)):
-            return False
-        return (
-            getattr(ov, "open_time_hhmm", None) is not None
-            or getattr(ov, "close_time_hhmm", None) is not None
-            or getattr(ov, "slot_minutes", None) is not None
-        )
+        try:
+            ov = admin_ops_uc.get_day_override(ymd)
+        except Exception:
+            ov = None
+        if ov is not None and not bool(getattr(ov, "is_closed", False)):
+            if (
+                getattr(ov, "open_time_hhmm", None) is not None
+                or getattr(ov, "close_time_hhmm", None) is not None
+                or getattr(ov, "slot_minutes", None) is not None
+            ):
+                return True
+        try:
+            if admin_ops_uc.day_has_disabled_slot(ymd):
+                return True
+        except Exception:
+            pass
+        return False
 
     if action == "home":
         await callback.message.answer(
@@ -651,7 +712,11 @@ async def admin_callback(
         sc = admin_ops_uc.get_schedule()
         b = InlineKeyboardBuilder()
         b.button(text="Изменить начало", callback_data=build_admin_ops_schedule_edit("open"))
-        b.button(text="Изменить конец", callback_data=build_admin_ops_schedule_edit("close"))
+        b.button(text="Изменить последний слот", callback_data=build_admin_ops_schedule_edit("close"))
+        b.button(
+            text="Изменить конец рабочего дня",
+            callback_data=build_admin_ops_schedule_edit("workday_end"),
+        )
         b.button(text="Шаг слотов", callback_data=build_admin_ops_schedule_slot_step())
         b.button(text="Календарь по дням", callback_data=build_admin_records())
         b.button(text="« Меню", callback_data=build_admin_home())
@@ -749,10 +814,20 @@ async def admin_callback(
             await state.set_state(AdminStates.schedule_close)
             await callback.message.answer(
                 "⚠️ <b>Внимание</b>\n\n"
-                "Изменение общего конца дня приведёт все индивидуальные настройки "
-                "времени окончания по конкретным дням к одному формату с новым общим "
-                "значением (переопределения конца по дням будут сброшены).\n\n"
-                "Введите новый конец дня (HH:MM, минуты только :00 или :30), например 18:30",
+                "Изменение общего последнего слота приведёт все индивидуальные настройки "
+                "последнего слота по конкретным дням к одному формату с новым общим "
+                "значением (переопределения последнего слота по дням будут сброшены).\n\n"
+                "Введите новый последний слот (HH:MM, минуты только :00 или :30), например 18:30",
+                reply_markup=admin_reply_keyboard(),
+            )
+            return
+        if field == "workday_end":
+            await state.set_state(AdminStates.schedule_workday_end)
+            await callback.message.answer(
+                "⚠️ <b>Внимание</b>\n\n"
+                "Изменение общего конца рабочего дня потребует подтверждения и "
+                "сбросит индивидуальные настройки конца рабочего дня по датам.\n\n"
+                "Введите новый конец рабочего дня (HH:MM, минуты только :00 или :30), например 20:00",
                 reply_markup=admin_reply_keyboard(),
             )
             return
@@ -1149,9 +1224,15 @@ async def admin_callback(
                 b.button(text=f"{label} · выходной", callback_data="a1|noop")
                 continue
             if ap is None:
+                if admin_ops_uc.is_slot_disabled(ymd, hhmm):
+                    b.button(
+                        text=f"⛔{label}",
+                        callback_data=build_admin_slot_open(ymd, hhmm),
+                    )
+                    continue
                 b.button(
                     text=f"{label} · свободно",
-                    callback_data=build_admin_time_slot(ymd, hhmm),
+                    callback_data=build_admin_slot_open(ymd, hhmm),
                 )
             else:
                 b.button(
@@ -1163,8 +1244,11 @@ async def admin_callback(
         else:
             b.button(text="⛔ Закрыть день", callback_data=build_admin_day_toggle(ymd, False))
             b.button(text="Изм. начало дня", callback_data=build_admin_day_edit(ymd, "open"))
-            b.button(text="Изм. конец дня", callback_data=build_admin_day_edit(ymd, "close"))
-            b.button(text="Изм. шаг", callback_data=build_admin_day_edit(ymd, "step"))
+            b.button(text="Изм. последний слот", callback_data=build_admin_day_edit(ymd, "close"))
+            b.button(
+                text="Изм. конец рабочего дня",
+                callback_data=build_admin_day_edit(ymd, "workday_end"),
+            )
         b.button(text="« К календарю", callback_data=build_admin_month(0))
         b.button(text="« Меню", callback_data=build_admin_home())
         b.adjust(1)
@@ -1172,7 +1256,8 @@ async def admin_callback(
             callback,
             (
                 f"Записи на {_fmt_ymd(ymd)}: {'день закрыт' if is_closed else 'выберите время'}\n"
-                f"Диапазон: {_fmt_hhmm(day_sched.open_time_hhmm)}-{_fmt_hhmm(day_sched.close_time_hhmm)}, "
+                f"Диапазон стартов: {_fmt_hhmm(day_sched.open_time_hhmm)}-{_fmt_hhmm(day_sched.close_time_hhmm)}\n"
+                f"Конец рабочего дня: {_fmt_hhmm(day_sched.workday_end_time_hhmm)}, "
                 f"шаг {_fmt_duration_minutes(day_sched.slot_minutes)}"
             ),
             reply_markup=b.as_markup(),
@@ -1210,20 +1295,91 @@ async def admin_callback(
         if field == "close":
             await state.set_state(AdminStates.day_schedule_close)
             await callback.message.answer(
-                "Введите конец дня для этой даты (HH:MM, минуты только :00 или :30):",
+                "Введите последний слот для этой даты (HH:MM, минуты только :00 или :30):",
+                reply_markup=admin_reply_keyboard(),
+            )
+            return
+        if field == "workday_end":
+            await state.set_state(AdminStates.day_schedule_workday_end)
+            await callback.message.answer(
+                "Введите конец рабочего дня для этой даты (HH:MM, минуты только :00 или :30):",
                 reply_markup=admin_reply_keyboard(),
             )
             return
         if field == "step":
-            await state.set_state(AdminStates.day_schedule_step)
             await callback.message.answer(
-                "Введите шаг слотов для этой даты (мин, кратно 30):",
+                "Изменение шага слотов для конкретного дня отключено.",
                 reply_markup=admin_reply_keyboard(),
             )
             return
 
     if action == "ts" and len(parts) >= 2:
-        # callback уже подтверждён в _safe_cq_answer
+        # legacy callback from old keyboards: redirect to slot screen.
+        ymd = parts[0]
+        hhmm = parts[1]
+        action = "sl"
+        parts = [ymd, hhmm]
+    if action == "sl" and len(parts) >= 2:
+        ymd = parts[0]
+        hhmm = parts[1]
+        try:
+            items = appointment_uc.admin_list_for_date(ymd)
+        except AppError as e:
+            await callback.message.answer(
+                error_to_user_message(e),
+                reply_markup=admin_reply_keyboard(),
+            )
+            return
+        ap = _slot_is_occupied_for_items(items, admin_ops_uc, hhmm)
+        if ap is not None:
+            await _send_appointment_card(callback.message, ap, settings, admin_ops_uc)
+            return
+        disabled = admin_ops_uc.is_slot_disabled(ymd, hhmm)
+        b = InlineKeyboardBuilder()
+        if disabled:
+            b.button(text="✅ Включить", callback_data=build_admin_slot_toggle(ymd, hhmm, True))
+        else:
+            b.button(text="⛔ Отключить", callback_data=build_admin_slot_toggle(ymd, hhmm, False))
+        b.button(text="⬅️ Назад", callback_data=build_admin_month_date(ymd))
+        b.button(text="🏠 Меню", callback_data=build_admin_home())
+        b.adjust(1)
+        await callback.message.answer(
+            f"Слот {_fmt_ymd(ymd)} {hhmm[:2]}:{hhmm[2:]} — "
+            f"{'отключён' if disabled else 'активен'}",
+            reply_markup=b.as_markup(),
+        )
+        return
+    if action == "slt" and len(parts) >= 3:
+        ymd = parts[0]
+        hhmm = parts[1]
+        enable = parts[2] == "1"
+        try:
+            items = appointment_uc.admin_list_for_date(ymd)
+        except AppError as e:
+            await callback.message.answer(
+                error_to_user_message(e),
+                reply_markup=admin_reply_keyboard(),
+            )
+            return
+        ap = _slot_is_occupied_for_items(items, admin_ops_uc, hhmm)
+        if ap is not None:
+            await callback.message.answer(
+                "Нельзя изменить статус занятого слота.",
+                reply_markup=admin_reply_keyboard(),
+            )
+            return
+        try:
+            admin_ops_uc.set_slot_disabled(ymd, hhmm, is_disabled=not enable)
+        except AppError as e:
+            await callback.message.answer(
+                error_to_user_message(e),
+                reply_markup=admin_reply_keyboard(),
+            )
+            return
+        await callback.message.answer(
+            "Слот включён." if enable else "Слот отключён.",
+            reply_markup=admin_reply_keyboard(),
+        )
         return
 
     if action == "bk":
@@ -1412,12 +1568,29 @@ async def admin_callback(
             )
             return
         sched = admin_ops_uc.get_effective_schedule_for_date(ymd)
-        step_minutes = admin_ops_uc.get_service_slot_step_minutes(ap.service_id)
-        slots = _slots_for_schedule(sched.open_time_hhmm, sched.close_time_hhmm, step_minutes)
+        slots = _slots_for_schedule(
+            sched.open_time_hhmm,
+            sched.close_time_hhmm,
+            sched.slot_minutes,
+        )
         b = InlineKeyboardBuilder()
         free_slots: list[str] = []
         for hhmm in slots:
-            if _slot_is_occupied_for_items(items, admin_ops_uc, hhmm, exclude_appointment_id=ap.appointment_id):
+            if admin_ops_uc.is_slot_disabled(ymd, hhmm):
+                b.button(
+                    text=f"⛔{hhmm[:2]}:{hhmm[2:]}",
+                    callback_data="a1|noop",
+                )
+                continue
+            if _slot_is_occupied_for_items(
+                items,
+                admin_ops_uc,
+                hhmm,
+                date_yyyymmdd=ymd,
+                exclude_appointment_id=ap.appointment_id,
+                requested_service_id=ap.service_id,
+                workday_end_hhmm=sched.workday_end_time_hhmm,
+            ):
                 continue
             free_slots.append(hhmm)
             b.button(
@@ -1782,8 +1955,8 @@ async def admin_schedule_set_close(
         return
     await state.clear()
     await message.answer(
-        "Конец дня обновлён.\n"
-        "Индивидуальные времена окончания по дням приведены к общему формату.",
+        "Последний слот обновлён.\n"
+        "Индивидуальные значения последнего слота по дням приведены к общему формату.",
         reply_markup=admin_reply_keyboard(),
     )
 
@@ -1820,6 +1993,68 @@ async def admin_schedule_set_step(
         "Общий шаг слотов обновлён: "
         f"{_fmt_duration_minutes(step)}.\n"
         "Индивидуальные шаги по дням приведены к этому же формату.",
+        reply_markup=admin_reply_keyboard(),
+    )
+
+
+@router.message(AdminStates.schedule_workday_end, F.text)
+async def admin_schedule_set_workday_end(
+    message: Message,
+    state: FSMContext,
+    settings: Settings,
+    admin_ops_uc: AdminOpsUseCases,
+) -> None:
+    uid = message.from_user.id if message.from_user else None
+    if not _is_admin(uid, settings):
+        await state.clear()
+        return
+    value = (message.text or "").strip()
+    await state.update_data(pending_workday_end_hhmm=value)
+    await state.set_state(AdminStates.schedule_workday_end_confirm)
+    await message.answer(
+        "Подтвердите изменение общего конца рабочего дня.\n"
+        "Это действие сбросит только индивидуальные переопределения конца рабочего дня по датам.\n"
+        "Ответьте: ДА",
+        reply_markup=admin_reply_keyboard(),
+    )
+
+
+@router.message(AdminStates.schedule_workday_end_confirm, F.text)
+async def admin_schedule_set_workday_end_confirm(
+    message: Message,
+    state: FSMContext,
+    settings: Settings,
+    admin_ops_uc: AdminOpsUseCases,
+) -> None:
+    uid = message.from_user.id if message.from_user else None
+    if not _is_admin(uid, settings):
+        await state.clear()
+        return
+    answer = (message.text or "").strip().lower()
+    if answer != "да":
+        await state.clear()
+        await message.answer(
+            "Изменение отменено.",
+            reply_markup=admin_reply_keyboard(),
+        )
+        return
+    data = await state.get_data()
+    value = (data.get("pending_workday_end_hhmm") or "").strip()
+    try:
+        admin_ops_uc.update_schedule(
+            workday_end_time_hhmm=value,
+            reset_day_workday_end_overrides=True,
+        )
+    except AppError as e:
+        await message.answer(
+            error_to_user_message(e) + _ADMIN_FSM_TIME_HINT,
+            reply_markup=admin_reply_keyboard(),
+        )
+        return
+    await state.clear()
+    await message.answer(
+        "Конец рабочего дня обновлён.\n"
+        "Индивидуальные переопределения конца рабочего дня по датам сброшены.",
         reply_markup=admin_reply_keyboard(),
     )
 
@@ -1889,7 +2124,7 @@ async def admin_day_schedule_set_close(
         return
     await state.clear()
     await message.answer(
-        "Конец дня обновлён.",
+        "Последний слот обновлён.",
         reply_markup=admin_reply_keyboard(),
     )
 
@@ -1931,6 +2166,41 @@ async def admin_day_schedule_set_step(
     await state.clear()
     await message.answer(
         "Шаг слотов для дня обновлён.",
+        reply_markup=admin_reply_keyboard(),
+    )
+
+
+@router.message(AdminStates.day_schedule_workday_end, F.text)
+async def admin_day_schedule_set_workday_end(
+    message: Message,
+    state: FSMContext,
+    settings: Settings,
+    admin_ops_uc: AdminOpsUseCases,
+) -> None:
+    uid = message.from_user.id if message.from_user else None
+    if not _is_admin(uid, settings):
+        await state.clear()
+        return
+    data = await state.get_data()
+    ymd = str(data.get("day_ymd") or "")
+    if not ymd:
+        await state.clear()
+        await message.answer(
+            "Сессия устарела.",
+            reply_markup=admin_reply_keyboard(),
+        )
+        return
+    try:
+        admin_ops_uc.update_day_schedule(ymd, workday_end_time_hhmm=(message.text or "").strip())
+    except AppError as e:
+        await message.answer(
+            error_to_user_message(e) + _ADMIN_FSM_TIME_HINT,
+            reply_markup=admin_reply_keyboard(),
+        )
+        return
+    await state.clear()
+    await message.answer(
+        "Конец рабочего дня для даты обновлён.",
         reply_markup=admin_reply_keyboard(),
     )
 

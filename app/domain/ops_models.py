@@ -16,6 +16,7 @@ def _new_id() -> str:
 class ScheduleSettings:
     open_time_hhmm: str = "0800"
     close_time_hhmm: str = "2000"
+    workday_end_time_hhmm: str = "2000"
     slot_minutes: int = 60
     updated_at: str = field(default_factory=_now_iso)
 
@@ -60,7 +61,16 @@ class DayScheduleOverride:
     is_closed: bool = False
     open_time_hhmm: Optional[str] = None
     close_time_hhmm: Optional[str] = None
+    workday_end_time_hhmm: Optional[str] = None
     slot_minutes: Optional[int] = None
+    updated_at: str = field(default_factory=_now_iso)
+
+
+@dataclass
+class DaySlotOverride:
+    date_yyyymmdd: str = ""
+    slot_hhmm: str = ""
+    is_disabled: bool = False
     updated_at: str = field(default_factory=_now_iso)
 
 

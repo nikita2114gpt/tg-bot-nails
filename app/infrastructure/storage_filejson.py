@@ -11,6 +11,7 @@ from app.domain.ops_models import (
     BlacklistEntry,
     ClientLifecycleMarker,
     DayScheduleOverride,
+    DaySlotOverride,
     PriceListItem,
     SalonInfoSettings,
     ScheduleSettings,
@@ -56,6 +57,7 @@ def _load_data():
                 "blacklist_entries": [],
                 "client_lifecycle_markers": [],
                 "day_schedule_overrides": [],
+                "day_slot_overrides": [],
                 "salon_info_settings": {},
                 "price_list": [],
             }
@@ -87,6 +89,7 @@ def _load_data():
             "blacklist_entries": _ensure_list(raw.get("blacklist_entries")),
             "client_lifecycle_markers": _ensure_list(raw.get("client_lifecycle_markers")),
             "day_schedule_overrides": _ensure_list(raw.get("day_schedule_overrides")),
+            "day_slot_overrides": _ensure_list(raw.get("day_slot_overrides")),
             "salon_info_settings": _safe_dict(raw.get("salon_info_settings")),
             "price_list": _ensure_list(raw.get("price_list")),
         }
@@ -313,6 +316,7 @@ def _schedule_to_dict(value: ScheduleSettings) -> dict:
     return {
         "open_time_hhmm": value.open_time_hhmm,
         "close_time_hhmm": value.close_time_hhmm,
+        "workday_end_time_hhmm": value.workday_end_time_hhmm,
         "slot_minutes": value.slot_minutes,
         "updated_at": value.updated_at,
     }
@@ -328,6 +332,9 @@ def _schedule_from_dict(data: dict) -> Optional[ScheduleSettings]:
     return ScheduleSettings(
         open_time_hhmm=str(data.get("open_time_hhmm") or "0800"),
         close_time_hhmm=str(data.get("close_time_hhmm") or "2000"),
+        workday_end_time_hhmm=str(
+            data.get("workday_end_time_hhmm") or data.get("close_time_hhmm") or "2000"
+        ),
         slot_minutes=slot_minutes,
         updated_at=data.get("updated_at") if isinstance(data.get("updated_at"), str) else _now_iso(),
     )
@@ -471,6 +478,7 @@ def _day_override_to_dict(value: DayScheduleOverride) -> dict:
         "is_closed": value.is_closed,
         "open_time_hhmm": value.open_time_hhmm,
         "close_time_hhmm": value.close_time_hhmm,
+        "workday_end_time_hhmm": value.workday_end_time_hhmm,
         "slot_minutes": value.slot_minutes,
         "updated_at": value.updated_at,
     }
@@ -497,7 +505,36 @@ def _day_override_from_dict(data: dict) -> Optional[DayScheduleOverride]:
         close_time_hhmm=data.get("close_time_hhmm")
         if isinstance(data.get("close_time_hhmm"), str)
         else None,
+        workday_end_time_hhmm=data.get("workday_end_time_hhmm")
+        if isinstance(data.get("workday_end_time_hhmm"), str)
+        else None,
         slot_minutes=slot_minutes,
+        updated_at=data.get("updated_at") if isinstance(data.get("updated_at"), str) else _now_iso(),
+    )
+
+
+def _day_slot_override_to_dict(value: DaySlotOverride) -> dict:
+    return {
+        "date_yyyymmdd": value.date_yyyymmdd,
+        "slot_hhmm": value.slot_hhmm,
+        "is_disabled": value.is_disabled,
+        "updated_at": value.updated_at,
+    }
+
+
+def _day_slot_override_from_dict(data: dict) -> Optional[DaySlotOverride]:
+    if not isinstance(data, dict):
+        return None
+    date_yyyymmdd = data.get("date_yyyymmdd")
+    slot_hhmm = data.get("slot_hhmm")
+    if not isinstance(date_yyyymmdd, str) or not date_yyyymmdd:
+        return None
+    if not isinstance(slot_hhmm, str) or not slot_hhmm:
+        return None
+    return DaySlotOverride(
+        date_yyyymmdd=date_yyyymmdd,
+        slot_hhmm=slot_hhmm,
+        is_disabled=bool(data.get("is_disabled", False)),
         updated_at=data.get("updated_at") if isinstance(data.get("updated_at"), str) else _now_iso(),
     )
 
@@ -816,6 +853,41 @@ class DayScheduleOverrideRepository:
         rows = [x for x in rows if x.get("date_yyyymmdd") != item.date_yyyymmdd]
         rows.append(_day_override_to_dict(item))
         data["day_schedule_overrides"] = rows
+        _save_data(data)
+
+
+class DaySlotOverrideRepository:
+    def get(self, date_yyyymmdd: str, slot_hhmm: str) -> Optional[DaySlotOverride]:
+        data = _load_data()
+        for row in _ensure_list(data.get("day_slot_overrides")):
+            item = _day_slot_override_from_dict(row) if isinstance(row, dict) else None
+            if item is not None and item.date_yyyymmdd == date_yyyymmdd and item.slot_hhmm == slot_hhmm:
+                return item
+        return None
+
+    def list_by_date(self, date_yyyymmdd: str) -> list[DaySlotOverride]:
+        data = _load_data()
+        result: list[DaySlotOverride] = []
+        for row in _ensure_list(data.get("day_slot_overrides")):
+            item = _day_slot_override_from_dict(row) if isinstance(row, dict) else None
+            if item is not None and item.date_yyyymmdd == date_yyyymmdd:
+                result.append(item)
+        result.sort(key=lambda x: x.slot_hhmm)
+        return result
+
+    def save(self, item: DaySlotOverride) -> None:
+        data = _load_data()
+        rows = [x for x in _ensure_list(data.get("day_slot_overrides")) if isinstance(x, dict)]
+        rows = [
+            x
+            for x in rows
+            if not (
+                x.get("date_yyyymmdd") == item.date_yyyymmdd
+                and x.get("slot_hhmm") == item.slot_hhmm
+            )
+        ]
+        rows.append(_day_slot_override_to_dict(item))
+        data["day_slot_overrides"] = rows
         _save_data(data)
 
 

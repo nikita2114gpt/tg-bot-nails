@@ -232,8 +232,8 @@ class BookingUseCases:
             raise UserInputError("Сначала нужно выбрать дату")
 
         start_datetime_utc = f"{draft.appointment_date}T{time_value}"
-        now_key = datetime.utcnow().strftime("%Y%m%dT%H%M")
-        if start_datetime_utc < now_key:
+        now_key = datetime.now().strftime("%Y%m%dT%H%M")
+        if start_datetime_utc <= now_key:
             raise UserInputError("Нельзя выбрать прошедшее время")
 
         updated = replace(

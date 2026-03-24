@@ -9,6 +9,7 @@ from app.core.errors import ConflictError, NotFoundError, UserInputError
 from app.domain.ops_models import (
     BlacklistEntry,
     DayScheduleOverride,
+    DaySlotOverride,
     PriceListItem,
     SalonInfoSettings,
     ScheduleSettings,
@@ -53,6 +54,7 @@ class AdminOpsUseCases:
         service_repo,
         blacklist_repo,
         day_schedule_repo=None,
+        day_slot_override_repo=None,
         salon_info_repo=None,
         price_list_repo=None,
     ) -> None:
@@ -60,6 +62,7 @@ class AdminOpsUseCases:
         self.service_repo = service_repo
         self.blacklist_repo = blacklist_repo
         self.day_schedule_repo = day_schedule_repo
+        self.day_slot_override_repo = day_slot_override_repo
         self.salon_info_repo = salon_info_repo
         self.price_list_repo = price_list_repo
 
@@ -179,6 +182,7 @@ class AdminOpsUseCases:
             return ScheduleSettings(
                 open_time_hhmm=base.open_time_hhmm,
                 close_time_hhmm=base.close_time_hhmm,
+                workday_end_time_hhmm=base.workday_end_time_hhmm or base.close_time_hhmm,
                 slot_minutes=base.slot_minutes,
                 updated_at=base.updated_at,
             )
@@ -188,9 +192,18 @@ class AdminOpsUseCases:
         return ScheduleSettings(
             open_time_hhmm=override.open_time_hhmm or base.open_time_hhmm,
             close_time_hhmm=override.close_time_hhmm or base.close_time_hhmm,
+            workday_end_time_hhmm=(
+                override.workday_end_time_hhmm
+                or base.workday_end_time_hhmm
+                or base.close_time_hhmm
+            ),
             slot_minutes=override.slot_minutes or base.slot_minutes,
             updated_at=override.updated_at,
         )
+
+    def get_effective_workday_end_for_date(self, date_yyyymmdd: str) -> str:
+        sched = self.get_effective_schedule_for_date(date_yyyymmdd)
+        return sched.workday_end_time_hhmm or sched.close_time_hhmm
 
     def set_day_closed(self, date_yyyymmdd: str, is_closed: bool) -> DayScheduleOverride:
         if self.day_schedule_repo is None:
@@ -208,6 +221,7 @@ class AdminOpsUseCases:
         *,
         open_time_hhmm: Optional[str] = None,
         close_time_hhmm: Optional[str] = None,
+        workday_end_time_hhmm: Optional[str] = None,
         slot_minutes: Optional[int] = None,
     ) -> DayScheduleOverride:
         if self.day_schedule_repo is None:
@@ -226,6 +240,15 @@ class AdminOpsUseCases:
             if close_time_hhmm is not None
             else (current.close_time_hhmm or self.get_schedule().close_time_hhmm)
         )
+        new_workday_end = (
+            _parse_hhmm(workday_end_time_hhmm)
+            if workday_end_time_hhmm is not None
+            else (
+                current.workday_end_time_hhmm
+                or self.get_schedule().workday_end_time_hhmm
+                or self.get_schedule().close_time_hhmm
+            )
+        )
         new_step = (
             int(slot_minutes)
             if slot_minutes is not None
@@ -235,12 +258,18 @@ class AdminOpsUseCases:
             _assert_slot_minutes_step30(new_step)
         if _hhmm_to_minutes(new_close) <= _hhmm_to_minutes(new_open):
             raise ConflictError("Конец дня должен быть позже начала дня.")
+        if _hhmm_to_minutes(new_close) > _hhmm_to_minutes(new_workday_end):
+            raise ConflictError(
+                "Последний слот не может быть позже конца рабочего дня. "
+                "Сначала увеличьте конец рабочего дня."
+            )
 
         updated = replace(
             current,
             is_closed=False,
             open_time_hhmm=new_open,
             close_time_hhmm=new_close,
+            workday_end_time_hhmm=new_workday_end,
             slot_minutes=new_step,
             updated_at=_now_iso(),
         )
@@ -252,19 +281,32 @@ class AdminOpsUseCases:
         *,
         open_time_hhmm: Optional[str] = None,
         close_time_hhmm: Optional[str] = None,
+        workday_end_time_hhmm: Optional[str] = None,
         slot_minutes: Optional[int] = None,
+        reset_day_workday_end_overrides: bool = False,
     ) -> ScheduleSettings:
         current = self.schedule_repo.get()
         open_hhmm = _parse_hhmm(open_time_hhmm) if open_time_hhmm is not None else current.open_time_hhmm
         close_hhmm = _parse_hhmm(close_time_hhmm) if close_time_hhmm is not None else current.close_time_hhmm
+        workday_end_hhmm = (
+            _parse_hhmm(workday_end_time_hhmm)
+            if workday_end_time_hhmm is not None
+            else (current.workday_end_time_hhmm or current.close_time_hhmm)
+        )
         new_step = int(slot_minutes) if slot_minutes is not None else current.slot_minutes
         if slot_minutes is not None:
             _assert_slot_minutes_step30(new_step)
         if _hhmm_to_minutes(close_hhmm) <= _hhmm_to_minutes(open_hhmm):
             raise ConflictError("Конец дня должен быть позже начала дня.")
+        if _hhmm_to_minutes(close_hhmm) > _hhmm_to_minutes(workday_end_hhmm):
+            raise ConflictError(
+                "Последний слот не может быть позже конца рабочего дня. "
+                "Сначала увеличьте конец рабочего дня."
+            )
         updated = ScheduleSettings(
             open_time_hhmm=open_hhmm,
             close_time_hhmm=close_hhmm,
+            workday_end_time_hhmm=workday_end_hhmm,
             slot_minutes=new_step,
             updated_at=_now_iso(),
         )
@@ -273,6 +315,8 @@ class AdminOpsUseCases:
             self._clear_day_override_open_times()
         if close_time_hhmm is not None:
             self._clear_day_override_close_times()
+        if workday_end_time_hhmm is not None and reset_day_workday_end_overrides:
+            self._clear_day_override_workday_end_times()
         return updated
 
     def _clear_day_override_open_times(self) -> None:
@@ -299,6 +343,18 @@ class AdminOpsUseCases:
             cleared = replace(row, close_time_hhmm=None, updated_at=_now_iso())
             self.day_schedule_repo.save(cleared)
 
+    def _clear_day_override_workday_end_times(self) -> None:
+        if self.day_schedule_repo is None:
+            return
+        list_fn = getattr(self.day_schedule_repo, "list_all", None)
+        if not callable(list_fn):
+            return
+        for row in list_fn():
+            if row.workday_end_time_hhmm is None:
+                continue
+            cleared = replace(row, workday_end_time_hhmm=None, updated_at=_now_iso())
+            self.day_schedule_repo.save(cleared)
+
     def update_schedule_slot_unify_day_overrides(self, slot_minutes: int) -> ScheduleSettings:
         """Сохраняет глобальный шаг слотов и сбрасывает индивидуальные slot_minutes у day override."""
         updated = self.update_schedule(slot_minutes=slot_minutes)
@@ -312,6 +368,76 @@ class AdminOpsUseCases:
                 continue
             cleared = replace(row, slot_minutes=None, updated_at=_now_iso())
             self.day_schedule_repo.save(cleared)
+        return updated
+
+    def get_day_slot_override(self, date_yyyymmdd: str, slot_hhmm: str) -> Optional[DaySlotOverride]:
+        if self.day_slot_override_repo is None:
+            return None
+        return self.day_slot_override_repo.get(date_yyyymmdd, slot_hhmm)
+
+    def is_slot_disabled(self, date_yyyymmdd: str, slot_hhmm: str) -> bool:
+        row = self.get_day_slot_override(date_yyyymmdd, slot_hhmm)
+        return bool(row.is_disabled) if row is not None else False
+
+    def day_has_disabled_slot(self, date_yyyymmdd: str) -> bool:
+        repo = self.day_slot_override_repo
+        if repo is None:
+            return False
+        list_fn = getattr(repo, "list_by_date", None)
+        if not callable(list_fn):
+            return False
+        try:
+            for row in list_fn(date_yyyymmdd):
+                if bool(getattr(row, "is_disabled", False)):
+                    return True
+        except Exception:
+            return False
+        return False
+
+    def is_service_interval_blocked_by_disabled_slots(
+        self,
+        date_yyyymmdd: str,
+        start_hhmm: str,
+        duration_minutes: int,
+    ) -> bool:
+        repo = self.day_slot_override_repo
+        if repo is None:
+            return False
+        list_fn = getattr(repo, "list_by_date", None)
+        if not callable(list_fn):
+            return False
+        raw = (start_hhmm or "").strip()
+        if len(raw) != 4 or not raw.isdigit():
+            return False
+        new_start = int(raw[:2]) * 60 + int(raw[2:])
+        try:
+            dur = max(int(duration_minutes), 5)
+        except (TypeError, ValueError):
+            dur = 60
+        new_end = new_start + dur
+        for row in list_fn(date_yyyymmdd):
+            if not row.is_disabled:
+                continue
+            sh = (row.slot_hhmm or "").strip()
+            if len(sh) != 4 or not sh.isdigit():
+                continue
+            d_min = int(sh[:2]) * 60 + int(sh[2:])
+            if new_start <= d_min < new_end:
+                return True
+        return False
+
+    def set_slot_disabled(self, date_yyyymmdd: str, slot_hhmm: str, is_disabled: bool) -> DaySlotOverride:
+        if self.day_slot_override_repo is None:
+            raise ConflictError("Настройки слотов недоступны.")
+        current = self.day_slot_override_repo.get(date_yyyymmdd, slot_hhmm)
+        if current is None:
+            current = DaySlotOverride(date_yyyymmdd=date_yyyymmdd, slot_hhmm=slot_hhmm)
+        updated = replace(
+            current,
+            is_disabled=bool(is_disabled),
+            updated_at=_now_iso(),
+        )
+        self.day_slot_override_repo.save(updated)
         return updated
 
     def list_services(self) -> list[ServiceCatalogItem]:

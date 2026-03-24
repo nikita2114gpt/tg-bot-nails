@@ -61,6 +61,14 @@ def build_admin_time_slot(ymd: str, hhmm: str) -> str:
     return f"a1|ts|{ymd}|{hhmm}"
 
 
+def build_admin_slot_open(ymd: str, hhmm: str) -> str:
+    return f"a1|sl|{ymd}|{hhmm}"
+
+
+def build_admin_slot_toggle(ymd: str, hhmm: str, enable: bool) -> str:
+    return f"a1|slt|{ymd}|{hhmm}|{1 if enable else 0}"
+
+
 def build_admin_open(appt_id: str) -> str:
     return f"a1|p|{appt_id}"
 

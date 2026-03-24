@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from html import escape
 
 from aiogram import F, Router
@@ -100,17 +100,17 @@ _CLIENT_TIME_SCREEN = (
 _CONTACT_STEP_PROMPT = (
     "Шаг 4/5 - Укажите контактные данные.\n"
     "— отправить контакт кнопкой\n"
-    "— написать вручную, в формате: Имя Телефон📱"
+    "— написать вручную: имя и телефон в одном сообщении (запятая не обязательна), например: Иван +79991234567"
 )
 _ADMIN_CONTACT_STEP_PROMPT = (
     "Шаг 4/5 - Укажите контактные данные.\n"
-    "Напишите данные вручную.\n"
-    "Пример: Имя Номер"
+    "Напишите данные вручную: имя и номер в одном сообщении (запятая не обязательна).\n"
+    "Пример: Иван +79991234567"
 )
 
 
 def _parse_admin_contact_loose(text: str) -> tuple[str, str] | None:
-    """Мягкий разбор «Имя … телефон» без жёсткого формата."""
+    """Имя = весь текст до телефона; телефон — последний блок с достаточным числом цифр. Запятая опциональна."""
     raw = (text or "").strip()
     if not raw:
         return None
@@ -118,14 +118,19 @@ def _parse_admin_contact_loose(text: str) -> tuple[str, str] | None:
         parts = raw.split(",", 1)
         if len(parts) == 2:
             n, p = parts[0].strip(), parts[1].strip()
-            if len(n) >= 1 and len(p) >= 3:
-                return n, p
-    m = re.search(r"([+0-9][\d\s\-()]{8,})\s*$", raw)
+            if len(n) >= 1 and len(p) >= 1:
+                digits_p = re.sub(r"\D", "", p)
+                if len(digits_p) >= 10:
+                    return n, p
+    m = re.search(r"(\+?[\d\s\-\(\)]{10,})\s*$", raw)
     if not m:
         return None
     phone = m.group(1).strip()
     name = raw[: m.start()].strip()
     if len(name) < 1:
+        return None
+    digits = re.sub(r"\D", "", phone)
+    if len(digits) < 10:
         return None
     return name, phone
 
@@ -308,9 +313,7 @@ def _available_time_slots(
             start_minutes = int(open_raw[:2]) * 60 + int(open_raw[2:])
         if len(close_raw) == 4 and close_raw.isdigit():
             end_minutes = int(close_raw[:2]) * 60 + int(close_raw[2:])
-        if service_id:
-            step_minutes = max(admin_ops_uc.get_service_slot_step_minutes(service_id), 5)
-        elif isinstance(sched.slot_minutes, int) and sched.slot_minutes > 0:
+        if isinstance(sched.slot_minutes, int) and sched.slot_minutes > 0:
             step_minutes = max(sched.slot_minutes, 5)
         if end_minutes < start_minutes:
             end_minutes = start_minutes
@@ -336,13 +339,28 @@ def _hhmm_to_minutes(hhmm: str) -> int | None:
     return int(hhmm[:2]) * 60 + int(hhmm[2:])
 
 
+def _is_past_or_now_slot(ymd: str, hhmm: str) -> bool:
+    if len(ymd) != 8 or not ymd.isdigit():
+        return False
+    if len(hhmm) != 4 or not hhmm.isdigit():
+        return False
+    try:
+        slot_dt = datetime.strptime(f"{ymd}{hhmm}", "%Y%m%d%H%M")
+    except Exception:
+        return False
+    return slot_dt <= datetime.now()
+
+
 def _occupied_slots_with_duration(
     booking_uc: BookingUseCases,
     admin_ops_uc: AdminOpsUseCases,
     ymd: str,
     candidate_slots: list[str],
+    requested_service_id: str | None,
+    workday_end_hhmm: str | None,
     *,
     preloaded_day_appointments: list | None = None,
+    include_disabled: bool = True,
 ) -> set[str]:
     if preloaded_day_appointments is not None:
         rows = preloaded_day_appointments
@@ -355,6 +373,25 @@ def _occupied_slots_with_duration(
     candidate_minutes = {
         slot: minute for slot in candidate_slots if (minute := _hhmm_to_minutes(slot)) is not None
     }
+
+    try:
+        requested_duration_min = max(
+            int(admin_ops_uc.get_service_slot_step_minutes(requested_service_id or "")),
+            5,
+        )
+    except Exception:
+        requested_duration_min = 60
+    workday_end_min = _hhmm_to_minutes(workday_end_hhmm or "") if workday_end_hhmm else None
+
+    def _overlap(
+        new_start: int,
+        new_end: int,
+        existing_start: int,
+        existing_end: int,
+    ) -> bool:
+        return not (new_end <= existing_start or new_start >= existing_end)
+
+    existing_intervals: list[tuple[int, int]] = []
     for ap in rows:
         if ap.status.value == "cancelled":
             continue
@@ -370,9 +407,23 @@ def _occupied_slots_with_duration(
         except Exception:
             duration_min = 60
         end_min = start_min + duration_min
-        for slot, slot_min in candidate_minutes.items():
-            if start_min <= slot_min < end_min:
+        existing_intervals.append((start_min, end_min))
+
+    for slot, slot_min in candidate_minutes.items():
+        new_start = slot_min
+        new_end = slot_min + requested_duration_min
+        if include_disabled and admin_ops_uc.is_service_interval_blocked_by_disabled_slots(
+            ymd, slot, requested_duration_min
+        ):
+            occupied.add(slot)
+            continue
+        if workday_end_min is not None and new_end > workday_end_min:
+            occupied.add(slot)
+            continue
+        for existing_start, existing_end in existing_intervals:
+            if _overlap(new_start, new_end, existing_start, existing_end):
                 occupied.add(slot)
+                break
     return occupied
 
 
@@ -394,11 +445,14 @@ def _is_day_fully_busy(
     if not slots:
         return True
     pre = rows_cache.get(ymd, []) if rows_cache is not None else None
+    effective_workday_end = admin_ops_uc.get_effective_workday_end_for_date(ymd)
     occupied = _occupied_slots_with_duration(
         booking_uc,
         admin_ops_uc,
         ymd,
         slots,
+        service_id,
+        effective_workday_end,
         preloaded_day_appointments=pre if rows_cache is not None else None,
     )
     return all(slot in occupied for slot in slots)
@@ -615,7 +669,28 @@ async def _handle_action_date(
     )
     await state.set_state(BookingStates.choose_time)
     times = _available_time_slots(settings, admin_ops_uc, picked_date, draft.service_id)
-    occupied_slots = _occupied_slots_with_duration(booking_uc, admin_ops_uc, picked_date, times)
+    effective_workday_end = admin_ops_uc.get_effective_workday_end_for_date(picked_date)
+    occupied_slots = _occupied_slots_with_duration(
+        booking_uc,
+        admin_ops_uc,
+        picked_date,
+        times,
+        draft.service_id,
+        effective_workday_end,
+    )
+    occupied_appt_only = _occupied_slots_with_duration(
+        booking_uc,
+        admin_ops_uc,
+        picked_date,
+        times,
+        draft.service_id,
+        effective_workday_end,
+        include_disabled=False,
+    )
+    past_set = {slot for slot in times if _is_past_or_now_slot(picked_date, slot)}
+    occupied_slots |= past_set
+    occupied_appt_only |= past_set
+    disabled_slot_labels = occupied_slots - occupied_appt_only
     free_exists = any(slot not in occupied_slots for slot in times)
     if not free_exists:
         await state.set_state(BookingStates.choose_date)
@@ -655,7 +730,12 @@ async def _handle_action_date(
     await _safe_edit_text(
         callback,
         _CLIENT_TIME_SCREEN,
-        reply_markup=time_keyboard(draft_id, times, occupied_slots=occupied_slots),
+        reply_markup=time_keyboard(
+            draft_id,
+            times,
+            occupied_slots=occupied_slots,
+            disabled_slots=disabled_slot_labels,
+        ),
     )
 
 
@@ -1542,7 +1622,8 @@ async def contact_handler(
         parsed = _parse_admin_contact_loose(message.text)
         if parsed is None:
             await message.answer(
-                "Не удалось разобрать имя и телефон. Попробуйте ещё раз, например: Иван +79001234567",
+                "Укажите имя и номер телефона в одном сообщении.\n"
+                "Пример: Иван +79991234567 или Иван 89991234567",
                 reply_markup=admin_reply_keyboard(),
             )
             return
@@ -1553,22 +1634,21 @@ async def contact_handler(
     else:
         if not message.text:
             await message.answer(
-                "Введите: Имя, Телефон",
+                "Введите имя и номер телефона в одном сообщении.\n"
+                "Пример: Иван +79991234567",
                 reply_markup=main_menu_reply_keyboard(),
             )
             return
 
-        parts = message.text.split(",")
-
-        if len(parts) != 2:
+        parsed = _parse_admin_contact_loose(message.text)
+        if parsed is None:
             await message.answer(
-                "Введите в формате: Имя, Телефон",
+                "Укажите имя и номер телефона в одном сообщении.\n"
+                "Пример: Иван +79991234567 или Иван 89991234567",
                 reply_markup=main_menu_reply_keyboard(),
             )
             return
-
-        name = parts[0].strip()
-        phone = parts[1].strip()
+        name, phone = parsed
 
     try:
         draft = booking_uc.enter_contact(

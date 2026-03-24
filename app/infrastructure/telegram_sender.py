@@ -91,13 +91,15 @@ class TelegramSender:
         except Exception:
             hours_before = None
         appointment_id = str(p.get("appointment_id") or "")
-        phone_e164 = str(p.get("phone_e164") or "")
+        phone_e164 = str(p.get("phone_e164") or "").strip()
+        phone_block = f"\n\nТелефон: {phone_e164}" if phone_e164 else ""
 
         if hours_before == 24:
             text = (
                 "⏰ Напоминание о записи (за 24 часа)\n\n"
                 f"Услуга: {service_id}\n"
-                f"Дата/время: {_fmt_slot(start_datetime_utc)}\n\n"
+                f"Дата/время: {_fmt_slot(start_datetime_utc)}"
+                f"{phone_block}\n\n"
                 "Подтвердите, пожалуйста, что запись актуальна."
             )
         else:
@@ -105,12 +107,12 @@ class TelegramSender:
                 "⏰ Напоминание о записи\n\n"
                 f"Услуга: {service_id}\n"
                 f"Дата/время: {_fmt_slot(start_datetime_utc)}"
+                f"{phone_block}"
             )
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="✅ Подтверждаю", callback_data=build_reminder_confirm(appointment_id))],
                 [InlineKeyboardButton(text="❌ Отменить запись", callback_data=build_reminder_cancel(appointment_id))],
-                [InlineKeyboardButton(text="📞 Позвонить", url=f"tel:{phone_e164}")],
             ]
         )
         await self.bot.send_message(user_id, text, reply_markup=kb)

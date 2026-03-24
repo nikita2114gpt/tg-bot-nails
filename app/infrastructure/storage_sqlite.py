@@ -10,6 +10,7 @@ from app.domain.ops_models import (
     BlacklistEntry,
     ClientLifecycleMarker,
     DayScheduleOverride,
+    DaySlotOverride,
     PriceListItem,
     SalonInfoSettings,
     ScheduleSettings,
@@ -157,6 +158,7 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             id INTEGER PRIMARY KEY CHECK (id=1),
             open_time_hhmm TEXT NOT NULL,
             close_time_hhmm TEXT NOT NULL,
+            workday_end_time_hhmm TEXT,
             slot_minutes INTEGER NOT NULL,
             updated_at TEXT NOT NULL
         );
@@ -169,11 +171,31 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             is_closed INTEGER NOT NULL,
             open_time_hhmm TEXT,
             close_time_hhmm TEXT,
+            workday_end_time_hhmm TEXT,
             slot_minutes INTEGER,
             updated_at TEXT NOT NULL
         );
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS day_slot_overrides (
+            date_yyyymmdd TEXT NOT NULL,
+            slot_hhmm TEXT NOT NULL,
+            is_disabled INTEGER NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (date_yyyymmdd, slot_hhmm)
+        );
+        """
+    )
+    try:
+        conn.execute("ALTER TABLE schedule_settings ADD COLUMN workday_end_time_hhmm TEXT;")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE day_schedule_overrides ADD COLUMN workday_end_time_hhmm TEXT;")
+    except sqlite3.OperationalError:
+        pass
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS salon_info_settings (
@@ -384,6 +406,11 @@ def _schedule_settings_from_row(row: sqlite3.Row) -> Optional[ScheduleSettings]:
     return ScheduleSettings(
         open_time_hhmm=row["open_time_hhmm"] or "0800",
         close_time_hhmm=row["close_time_hhmm"] or "2000",
+        workday_end_time_hhmm=(
+            row["workday_end_time_hhmm"]
+            if isinstance(row["workday_end_time_hhmm"], str) and row["workday_end_time_hhmm"]
+            else (row["close_time_hhmm"] or "2000")
+        ),
         slot_minutes=slot_minutes,
         updated_at=updated_at,
     )
@@ -404,7 +431,24 @@ def _day_override_from_row(row: sqlite3.Row) -> Optional[DayScheduleOverride]:
         is_closed=bool(int(row["is_closed"])) if row["is_closed"] is not None else False,
         open_time_hhmm=row["open_time_hhmm"] if isinstance(row["open_time_hhmm"], str) else None,
         close_time_hhmm=row["close_time_hhmm"] if isinstance(row["close_time_hhmm"], str) else None,
+        workday_end_time_hhmm=(
+            row["workday_end_time_hhmm"]
+            if isinstance(row["workday_end_time_hhmm"], str)
+            else None
+        ),
         slot_minutes=slot_minutes,
+        updated_at=updated_at,
+    )
+
+
+def _day_slot_override_from_row(row: sqlite3.Row) -> Optional[DaySlotOverride]:
+    if row is None:
+        return None
+    updated_at = row["updated_at"] if isinstance(row["updated_at"], str) else _now_iso()
+    return DaySlotOverride(
+        date_yyyymmdd=row["date_yyyymmdd"] or "",
+        slot_hhmm=row["slot_hhmm"] or "",
+        is_disabled=bool(int(row["is_disabled"])) if row["is_disabled"] is not None else False,
         updated_at=updated_at,
     )
 
@@ -1073,17 +1117,19 @@ class ScheduleSettingsRepository:
         with _connect(self._db_path) as conn:
             conn.execute(
                 """
-                INSERT INTO schedule_settings (id, open_time_hhmm, close_time_hhmm, slot_minutes, updated_at)
-                VALUES (1, ?, ?, ?, ?)
+                INSERT INTO schedule_settings (id, open_time_hhmm, close_time_hhmm, workday_end_time_hhmm, slot_minutes, updated_at)
+                VALUES (1, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     open_time_hhmm=excluded.open_time_hhmm,
                     close_time_hhmm=excluded.close_time_hhmm,
+                    workday_end_time_hhmm=excluded.workday_end_time_hhmm,
                     slot_minutes=excluded.slot_minutes,
                     updated_at=excluded.updated_at
                 """,
                 (
                     settings.open_time_hhmm,
                     settings.close_time_hhmm,
+                    settings.workday_end_time_hhmm,
                     settings.slot_minutes,
                     settings.updated_at,
                 ),
@@ -1122,13 +1168,14 @@ class DayScheduleOverrideRepository:
             conn.execute(
                 """
                 INSERT INTO day_schedule_overrides (
-                    date_yyyymmdd, is_closed, open_time_hhmm, close_time_hhmm, slot_minutes, updated_at
+                    date_yyyymmdd, is_closed, open_time_hhmm, close_time_hhmm, workday_end_time_hhmm, slot_minutes, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(date_yyyymmdd) DO UPDATE SET
                     is_closed=excluded.is_closed,
                     open_time_hhmm=excluded.open_time_hhmm,
                     close_time_hhmm=excluded.close_time_hhmm,
+                    workday_end_time_hhmm=excluded.workday_end_time_hhmm,
                     slot_minutes=excluded.slot_minutes,
                     updated_at=excluded.updated_at
                 """,
@@ -1137,11 +1184,68 @@ class DayScheduleOverrideRepository:
                     1 if item.is_closed else 0,
                     item.open_time_hhmm,
                     item.close_time_hhmm,
+                    item.workday_end_time_hhmm,
                     item.slot_minutes,
                     item.updated_at,
                 ),
             )
 
+
+class DaySlotOverrideRepository:
+    def __init__(self, db_path: str | Path):
+        self._db_path = Path(db_path)
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        with _connect(self._db_path) as conn:
+            _init_schema(conn)
+
+    def get(self, date_yyyymmdd: str, slot_hhmm: str) -> Optional[DaySlotOverride]:
+        with _connect(self._db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM day_slot_overrides
+                WHERE date_yyyymmdd=? AND slot_hhmm=?
+                LIMIT 1
+                """,
+                (date_yyyymmdd, slot_hhmm),
+            ).fetchone()
+            return _day_slot_override_from_row(row)
+
+    def list_by_date(self, date_yyyymmdd: str) -> list[DaySlotOverride]:
+        with _connect(self._db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM day_slot_overrides
+                WHERE date_yyyymmdd=?
+                ORDER BY slot_hhmm ASC
+                """,
+                (date_yyyymmdd,),
+            ).fetchall()
+            result: list[DaySlotOverride] = []
+            for row in rows:
+                item = _day_slot_override_from_row(row)
+                if item is not None:
+                    result.append(item)
+            return result
+
+    def save(self, item: DaySlotOverride) -> None:
+        with _connect(self._db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO day_slot_overrides (
+                    date_yyyymmdd, slot_hhmm, is_disabled, updated_at
+                )
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(date_yyyymmdd, slot_hhmm) DO UPDATE SET
+                    is_disabled=excluded.is_disabled,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    item.date_yyyymmdd,
+                    item.slot_hhmm,
+                    1 if item.is_disabled else 0,
+                    item.updated_at,
+                ),
+            )
 
 class SalonInfoSettingsRepository:
     def __init__(self, db_path: str | Path):

@@ -172,16 +172,21 @@ def time_keyboard(
     draft_id: str,
     time_slots: list[str],
     occupied_slots: set[str] | None = None,
+    disabled_slots: set[str] | None = None,
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     occupied_slots = occupied_slots or set()
+    disabled_slots = disabled_slots or set()
 
     for time_value in time_slots:
         label = time_value
         if len(time_value) == 4 and time_value.isdigit():
             label = f"{time_value[:2]}:{time_value[2:]}"
         payload = time_value
-        if time_value in occupied_slots:
+        if time_value in disabled_slots:
+            label = f"⛔ {label}"
+            payload = f"x_{time_value}"
+        elif time_value in occupied_slots:
             label = f"🔒 {label}"
             payload = f"x_{time_value}"
         builder.button(
